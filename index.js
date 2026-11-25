@@ -102,88 +102,79 @@ function normalize(raw, fromDisk = false) {
   };
 }
 
-// Mô hình dự đoán xác định, không dùng random hoặc MD5
+// Context Tree Weighting (CTW) cho chuỗi T/X, với mốc tham chiếu 50/50.
+const MAX_DEPTH = 8;
+const MAX_INPUT_LENGTH = 4096;
 
-class Predictor {
+function contextNode() {
+  return { tai: 0, count: 0, logStopOverSplit: 0, children: {} };
+}
+
+function mix(first, second, logOdds) {
+  const weight = 1 / (1 + Math.exp(-logOdds));
+  return weight * first + (1 - weight) * second;
+}
+
+function logLikelihood(pTai, symbol) {
+  return symbol === 'T' ? Math.log(pTai) : Math.log1p(-pTai);
+}
+
+class TXSequence {
   constructor() {
-    // Bậc -1 là mốc 50/50. Bậc 0 học tần suất chung.
-    // Bậc 1–3 học tần suất sau 1–3 kết quả liên tiếp.
-    // Ban đầu, mốc 50/50 nhận một nửa tổng trọng số.
-    this.models = [-1, 0, 1, 2, 3].map(order => ({
-      order,
-      counts: new Map(),
-      logWeight: order < 0 ? Math.log(4) : 0
-    }));
-
-    this.tail = '';
+    this.root = contextNode();
+    this.suffix = '';
     this.lastId = null;
-    this.scored = 0;
-    this.hits = 0;
-    this.brier = 0;
+    this.logTreeOverFair = 0;
   }
 
-  context(order) {
-    if (order < 0 || this.tail.length < order) return null;
-    return order === 0 ? '' : this.tail.slice(-order);
+  // Tính xác suất trước khi cập nhật. Truy vấn với symbol=null chỉ đọc cây.
+  visit(node, depth, symbol) {
+    const local = (node.tai + 0.5) / (node.count + 1);
+    let prediction = local;
+
+    if (depth < MAX_DEPTH) {
+      const previous = this.suffix[this.suffix.length - 1 - depth];
+      let split = 0.5;
+
+      if (previous !== undefined) {
+        let child = node.children[previous];
+
+        if (!child && symbol !== null) {
+          child = contextNode();
+          node.children[previous] = child;
+        }
+
+        if (child) split = this.visit(child, depth + 1, symbol);
+      }
+
+      prediction = mix(local, split, node.logStopOverSplit);
+
+      if (symbol !== null) {
+        node.logStopOverSplit += logLikelihood(local, symbol) - logLikelihood(split, symbol);
+      }
+    }
+
+    if (symbol !== null) {
+      node.count++;
+      if (symbol === 'T') node.tai++;
+    }
+
+    return prediction;
   }
 
-  estimate() {
-    let weighted = 0;
-    let totalWeight = 0;
-
-    const parts = this.models.map(model => {
-      const key = this.context(model.order);
-      const counts = model.counts.get(key) ?? [0, 0];
-
-      // Làm trơn để một mẫu ngắn chưa thể cho xác suất 0% hoặc 100%.
-      const p = (counts[1] + 0.5) / (counts[0] + counts[1] + 1);
-      const weight = Math.exp(model.logWeight);
-
-      weighted += weight * p;
-      totalWeight += weight;
-
-      return { model, key, p };
-    });
-
-    return { p: weighted / totalWeight, parts };
+  probabilityTai() {
+    return mix(this.visit(this.root, 0, null), 0.5, this.logTreeOverFair);
   }
 
-  observe(row) {
-    const consecutive =
-      this.lastId !== null && row.id === this.lastId + 1;
+  append(symbol) {
+    const prediction = this.visit(this.root, 0, symbol);
+    this.logTreeOverFair += logLikelihood(prediction, symbol) + Math.LN2;
+    this.suffix = (this.suffix + symbol).slice(-MAX_DEPTH);
+  }
 
-    // Khi thiếu phiên, bắt đầu lại chuỗi ngữ cảnh tại vị trí mới.
-    if (!consecutive) this.tail = '';
-
-    // Lấy dự đoán trước khi học kết quả thật của phiên này.
-    const { p, parts } = this.estimate();
-    const y = row.result;
-
-    if (consecutive) {
-      this.scored++;
-      if ((p >= 0.5) === (y === 1)) this.hits++;
-      this.brier += (p - y) ** 2;
-    }
-
-    for (const { model, key, p: q } of parts) {
-      // Trọng số thay đổi theo xác suất từng mô hình đã gán
-      // cho kết quả thực tế trước khi nhìn thấy kết quả đó.
-      model.logWeight += y ? Math.log(q) : Math.log1p(-q);
-
-      if (key === null) continue;
-
-      const counts = model.counts.get(key) ?? [0, 0];
-      counts[y]++;
-      model.counts.set(key, counts);
-    }
-
-    // Giữ phép tính trọng số ổn định khi lịch sử dài.
-    const peak = Math.max(...this.models.map(m => m.logWeight));
-    for (const model of this.models) {
-      model.logWeight -= peak;
-    }
-
-    this.tail = (this.tail + y).slice(-3);
+  observeSession(row) {
+    if (row.id !== this.lastId + 1) this.suffix = '';
+    this.append(row.result === 1 ? 'T' : 'X');
     this.lastId = row.id;
   }
 }
@@ -222,6 +213,7 @@ function load() {
       if (!migrate) {
         throw new Error('Bản ghi không hợp lệ trong ' + file);
       }
+
       skipped++;
       continue;
     }
@@ -245,9 +237,9 @@ function load() {
 let history = load();
 const known = new Set(history.map(row => row.id));
 
-let model = new Predictor();
+let model = new TXSequence();
 for (const row of history) {
-  model.observe(row);
+  model.observeSession(row);
 }
 
 // Đồng bộ nguồn API
@@ -300,10 +292,10 @@ async function sync() {
     save(next);
 
     // Khi có phiên đến muộn, phát lại lịch sử theo đúng thứ tự.
-    if (backfill) model = new Predictor();
+    if (backfill) model = new TXSequence();
 
     for (const row of backfill ? next : added) {
-      model.observe(row);
+      model.observeSession(row);
     }
 
     for (const row of added) known.add(row.id);
@@ -320,7 +312,32 @@ function respond(req, res) {
     .toISOString()
     .replace('Z', '+07:00');
 
-  const row = history.at(-1);
+  let row = history.at(-1);
+  let engine = model;
+
+  // Chuỗi nhập tay có thể dùng ngay cả trước lần đồng bộ đầu tiên.
+  const input = req.query.chuoi;
+
+  if (input !== undefined) {
+    if (typeof input !== 'string' || input.length > MAX_INPUT_LENGTH ||
+        input.length === 0 || /[^TX]/i.test(input)) {
+      return res.status(400).json({
+        error: 'chuoi phải gồm 1–4096 ký tự T hoặc X.'
+      });
+    }
+
+    const sequence = input.toUpperCase();
+    engine = new TXSequence();
+
+    for (const symbol of sequence) engine.append(symbol);
+
+    row = {
+      id: null,
+      result: Number(sequence.endsWith('T')),
+      dices: [],
+      sum: null
+    };
+  }
 
   if (!row) {
     return res.json({
@@ -330,8 +347,7 @@ function respond(req, res) {
     });
   }
 
-  const { p } = model.estimate();
-  const n = model.scored;
+  const pTai = engine.probabilityTai();
 
   const payload = {
     id: 'noname09',
@@ -339,16 +355,19 @@ function respond(req, res) {
     ketqua: row.result ? 'tai' : 'xiu',
     xucxac: row.dices,
     tong: row.sum,
-    dudoanphien: row.id + 1,
-    dudoan: p >= 0.5 ? 'tai' : 'xiu',
-    dotincay: Math.round(100 * Math.max(p, 1 - p)) + '%',
-    sophiendudoan: n + ' phiên',
-    sophiendung: model.hits + ' phiên',
-    sophiensai: (n - model.hits) + ' phiên',
+    dudoanphien: row.id === null ? null : row.id + 1,
+    dudoan: pTai >= 0.5 ? 'tai' : 'xiu',
+    dotincay: Math.round(100 * Math.max(pTai, 1 - pTai)) + '%',
     uptime
   };
 
-  return res.type('application/json').send(JSON.stringify(payload, null, 2));
+  // Giữ mảng ba mặt xúc xắc trên một dòng như mẫu.
+  const json = JSON.stringify(payload, null, 2).replace(
+    /"xucxac": \[\s*(\d),\s*(\d),\s*(\d)\s*\]/,
+    '"xucxac": [$1, $2, $3]'
+  );
+
+  return res.type('application/json').send(json);
 }
 
 app.get(['/', '/predict'], respond);
