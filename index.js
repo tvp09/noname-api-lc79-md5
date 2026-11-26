@@ -6,23 +6,22 @@ const path = require('node:path');
 const express = require('express');
 
 // ==========================================
-// CONFIG
+// CONFIGURATION
 // ==========================================
 
 const PORT = process.env.PORT || 3000;
-
 const API_ID = process.env.API_ID || 'noname09';
 
 const API_URL = process.env.API_URL ||
-    'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?at=6256356b3f81d9bd5e0950ecd13c7df0&cl=R&cp=R&pf=web';
+  'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?at=6256356b3f81d9bd5e0950ecd13c7df0&cl=R&cp=R&pf=web';
 
-const DATA_FILE = path.join(
-    process.env.DATA_DIR || __dirname,
-    'lichsulc79md5.json'
+const FILE = path.join(
+  process.env.DATA_DIR || __dirname,
+  'lichsulc79md5.json'
 );
 
-const MAX_HISTORY = 200;
-const CHECK_INTERVAL = 5000;
+const MAX = 200;
+const INTERVAL = 5000;
 
 const app = express();
 
@@ -30,674 +29,792 @@ app.disable('x-powered-by');
 app.set('json spaces', 2);
 
 app.use((req, res, next) => {
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    next();
+  res.set('Cache-Control', 'no-store');
+  res.set('Access-Control-Allow-Origin', '*');
+  next();
 });
 
 // ==========================================
-// DATABASE
+// UTILITIES
 // ==========================================
 
-function freshDatabase() {
-    return {
-        history: [],
-        sequence: '',
-        predictions: {},
-        statistics: []
-    };
+const vnTime = () =>
+  new Date(Date.now() + 25200000)
+    .toISOString()
+    .replace('Z', '+07:00');
+
+const name = s => s === 't' ? 'tai' : 'xiu';
+
+const pct = p => p.toFixed(2) + '%';
+
+const sequence = h =>
+  h.map(r => r.result).join('');
+
+const empty = () => ({
+  history: [],
+  sequence: '',
+  predictions: {},
+  statistics: []
+});
+
+// ==========================================
+// DATABASE ENGINE
+// ==========================================
+
+function load() {
+  if (!fs.existsSync(FILE)) {
+    return empty();
+  }
+
+  const data = {
+    ...empty(),
+    ...JSON.parse(
+      fs.readFileSync(FILE, 'utf8')
+    )
+  };
+
+  if (
+    !Array.isArray(data.history) ||
+    !Array.isArray(data.statistics) ||
+    !data.predictions ||
+    typeof data.predictions !== 'object'
+  ) {
+    throw new Error('Invalid history file');
+  }
+
+  data.history = data.history.slice(-MAX);
+  data.sequence = sequence(data.history);
+
+  return data;
 }
 
-function loadDatabase() {
-    if (!fs.existsSync(DATA_FILE)) {
-        return freshDatabase();
-    }
+let db = load();
 
-    return {
-        ...freshDatabase(),
-        ...JSON.parse(
-            fs.readFileSync(DATA_FILE, 'utf8')
-        )
-    };
+function commit(next) {
+  next.history = next.history.slice(-MAX);
+  next.sequence = sequence(next.history);
+  next.statistics = next.statistics.slice(-MAX);
+
+  fs.mkdirSync(
+    path.dirname(FILE),
+    { recursive: true }
+  );
+
+  fs.writeFileSync(
+    FILE + '.tmp',
+    JSON.stringify(next, null, 2),
+    'utf8'
+  );
+
+  fs.renameSync(FILE + '.tmp', FILE);
+
+  db = next;
 }
 
-let db = loadDatabase();
+// Không phân tích mẫu chuỗi qua các phiên bị thiếu
+function contiguous(h) {
+  let i = h.length - 1;
 
-function saveDatabase() {
-    db.history = db.history.slice(-MAX_HISTORY);
+  while (
+    i > 0 &&
+    h[i].id === h[i - 1].id + 1
+  ) {
+    i--;
+  }
 
-    db.sequence = db.history
-        .map(item => item.result)
-        .join('');
+  return sequence(
+    h.slice(Math.max(0, i))
+  );
+}
 
-    db.statistics = db.statistics.slice(-200);
+// ==========================================
+// ADAPTIVE STATISTICAL ENGINE
+// ==========================================
 
-    fs.mkdirSync(
-        path.dirname(DATA_FILE),
-        { recursive: true }
+const bayes = (t, n, a = 3) =>
+  (t + a) / (n + 2 * a);
+
+const clip = p =>
+  Math.max(0.001, Math.min(0.999, p));
+
+// MODEL 1: BAYESIAN FREQUENCY
+
+function frequency(s) {
+  return bayes(
+    [...s].filter(c => c === 't').length,
+    s.length
+  );
+}
+
+// MODEL 2: EXPONENTIAL DECAY
+
+function decay(s, halfLife) {
+  let t = 0;
+  let n = 0;
+
+  for (let i = 0; i < s.length; i++) {
+    const w = Math.pow(
+      0.5,
+      (s.length - 1 - i) / halfLife
     );
 
-    const temporaryFile = DATA_FILE + '.tmp';
+    n += w;
 
-    fs.writeFileSync(
-        temporaryFile,
-        JSON.stringify(db, null, 2),
-        'utf8'
-    );
+    if (s[i] === 't') {
+      t += w;
+    }
+  }
 
-    fs.renameSync(temporaryFile, DATA_FILE);
+  return bayes(t, n);
 }
 
-// ==========================================
-// STATISTICAL PREDICTION ENGINE
-// ==========================================
+// MODEL 3: VARIABLE-ORDER MARKOV + N-GRAM
 
-// Bayesian smoothing
-function bayesian(tai, total) {
-    return (tai + 4) / (total + 8);
-}
+function ngram(s, k) {
+  if (s.length <= k) {
+    return 0.5;
+  }
 
-// Phân tích tần suất
-function frequencyModel(sequence) {
-    const tai = [...sequence]
-        .filter(c => c === 't').length;
+  const pattern = s.slice(-k);
 
-    return bayesian(tai, sequence.length);
-}
+  let t = 0;
+  let n = 0;
 
-// Markov / N-gram
-function patternModel(sequence, length) {
-    if (sequence.length <= length) {
-        return 0.5;
+  for (let i = 0; i + k < s.length; i++) {
+    if (s.slice(i, i + k) !== pattern) {
+      continue;
     }
 
-    const pattern = sequence.slice(-length);
+    n++;
 
-    let tai = 0;
-    let total = 0;
+    if (s[i + k] === 't') {
+      t++;
+    }
+  }
 
-    for (
-        let i = 0;
-        i + length < sequence.length;
-        i++
+  return bayes(t, n);
+}
+
+// MODEL 4: STREAK ANALYSIS
+
+function streak(s) {
+  if (s.length < 2) {
+    return 0.5;
+  }
+
+  let run = 1;
+
+  for (
+    let i = s.length - 2;
+    i >= 0 && s[i] === s.at(-1);
+    i--
+  ) {
+    run++;
+  }
+
+  let t = 0;
+  let n = 0;
+  let r = 0;
+
+  for (let i = 0; i < s.length - 1; i++) {
+    r = i > 0 && s[i] === s[i - 1]
+      ? r + 1
+      : 1;
+
+    if (
+      s[i] !== s.at(-1) ||
+      Math.min(r, 6) !== Math.min(run, 6)
     ) {
-        const historicalPattern = sequence.slice(
-            i,
-            i + length
-        );
-
-        if (historicalPattern === pattern) {
-            total++;
-
-            if (sequence[i + length] === 't') {
-                tai++;
-            }
-        }
+      continue;
     }
 
-    return bayesian(tai, total);
+    n++;
+
+    if (s[i + 1] === 't') {
+      t++;
+    }
+  }
+
+  return bayes(t, n);
 }
 
-// Exponential weighted probability
-function exponentialModel(sequence) {
-    let tai = 4;
-    let total = 8;
+// MODEL 5: HAMMING SIMILARITY
 
-    [...sequence].reverse().forEach((c, i) => {
-        const weight = Math.exp(-i / 30);
+function similarity(s) {
+  const k = Math.min(
+    8,
+    Math.floor(s.length / 3)
+  );
 
-        total += weight;
+  if (k < 2) {
+    return 0.5;
+  }
 
-        if (c === 't') {
-            tai += weight;
-        }
-    });
+  const pattern = s.slice(-k);
 
-    return tai / total;
+  let t = 0;
+  let n = 0;
+
+  for (let i = 0; i + k < s.length; i++) {
+    let distance = 0;
+
+    for (let j = 0; j < k; j++) {
+      if (pattern[j] !== s[i + j]) {
+        distance++;
+      }
+    }
+
+    const w = Math.exp(-1.5 * distance);
+
+    n += w;
+
+    if (s[i + k] === 't') {
+      t += w;
+    }
+  }
+
+  return bayes(t, n);
 }
 
-// 9 mô hình thống kê
-const MODELS = [
-    () => 0.5,
-    frequencyModel,
-    s => patternModel(s, 1),
-    s => patternModel(s, 2),
-    s => patternModel(s, 3),
-    s => patternModel(s, 4),
-    s => patternModel(s, 5),
-    s => patternModel(s, 6),
-    exponentialModel
+// ==========================================
+// 14 STATISTICAL MODEL CONFIGURATIONS
+// ==========================================
+
+const models = [
+  () => 0.5,
+  frequency,
+
+  s => decay(s, 8),
+  s => decay(s, 24),
+
+  ...Array.from(
+    { length: 8 },
+    (_, i) => s => ngram(s, i + 1)
+  ),
+
+  streak,
+  similarity
 ];
 
-// Adaptive Ensemble + Walk Forward Validation
-function predict(sequence) {
-    const s = sequence.slice(-MAX_HISTORY);
+// ==========================================
+// ADAPTIVE ENSEMBLE
+// WALK FORWARD VALIDATION
+// ==========================================
 
-    const losses = MODELS.map(() => 0);
+function predict(input) {
+  const s = input.slice(-MAX);
 
-    let count = 0;
+  const losses = models.map(() => 0);
 
-    const start = Math.max(
-        20,
-        s.length - 80
+  let total = 0;
+
+  // Kiểm nghiệm trên tối đa 100 phiên.
+  // Không sử dụng dữ liệu tương lai.
+
+  for (
+    let i = Math.max(6, s.length - 100);
+    i < s.length;
+    i++
+  ) {
+    const prefix = s.slice(0, i);
+
+    const actual = s[i] === 't';
+
+    const w = Math.pow(
+      0.5,
+      (s.length - 1 - i) / 40
     );
 
-    for (let i = start; i < s.length; i++) {
-        const previous = s.slice(0, i);
-        const actual = s[i] === 't';
+    models.forEach((model, j) => {
+      const p = clip(model(prefix));
 
-        MODELS.forEach((model, index) => {
-            const p = model(previous);
+      losses[j] -= w * Math.log(
+        actual ? p : 1 - p
+      );
+    });
 
-            losses[index] -= Math.log(
-                actual ? p : 1 - p
-            );
-        });
+    total += w;
+  }
 
-        count++;
+  // Tự điều chỉnh trọng số theo Log Loss
+
+  const weights = losses.map(
+    (loss, j) =>
+      (j === 0 ? 3 : 1) *
+      Math.exp(
+        -8 * (loss - losses[0]) /
+        (total + 8)
+      )
+  );
+
+  const sum = weights.reduce(
+    (a, b) => a + b,
+    0
+  );
+
+  // Kết hợp tất cả mô hình
+
+  const raw = models.reduce(
+    (a, model, j) =>
+      a + weights[j] * model(s),
+    0
+  ) / sum;
+
+  // Đánh giá mức cải thiện so với mốc 50%
+
+  const bestGain = Math.max(
+    0,
+    losses[0] - Math.min(...losses)
+  );
+
+  const reliability =
+    (s.length / (s.length + 24)) *
+    (
+      0.25 +
+      0.75 * bestGain / (bestGain + 3)
+    );
+
+  // Confidence Shrinkage:
+  // Hạn chế độ tự tin thiếu căn cứ.
+
+  const p = clip(
+    0.5 + (raw - 0.5) * reliability
+  );
+
+  return {
+    side: p >= 0.5 ? 't' : 'x',
+
+    confidence:
+      100 * Math.max(p, 1 - p),
+
+    probabilityTai: p
+  };
+}
+
+// ==========================================
+// SOURCE API PARSER
+// ==========================================
+
+function parse(payload) {
+  if (!Array.isArray(payload.list)) {
+    throw new Error(
+      'API schema: missing list'
+    );
+  }
+
+  const map = new Map();
+
+  for (const r of payload.list) {
+    const id = Number(r.id);
+
+    const result = r.resultTruyenThong;
+
+    if (
+      !Number.isSafeInteger(id) ||
+      id <= 0 ||
+      !['TAI', 'XIU'].includes(result)
+    ) {
+      continue;
     }
 
-    // Điều chỉnh trọng số theo Log Loss
-    const weights = losses.map(loss =>
-        Math.exp(
-            -8 * loss / Math.max(1, count)
-        )
-    );
+    const dices = (
+      Array.isArray(r.dices)
+        ? r.dices
+        : String(r.dices ?? '')
+            .split(/[-,\s]+/)
+    ).map(Number);
 
-    const totalWeight = weights.reduce(
+    if (
+      dices.length !== 3 ||
+      !dices.every(d =>
+        Number.isInteger(d) &&
+        d >= 1 &&
+        d <= 6
+      )
+    ) {
+      continue;
+    }
+
+    const point = Number(r.point);
+
+    if (
+      point !== dices.reduce(
         (a, b) => a + b,
         0
-    );
+      )
+    ) {
+      continue;
+    }
 
-    let probability = MODELS.reduce(
-        (sum, model, index) => {
-            return sum +
-                model(s) * weights[index];
-        },
-        0
-    ) / totalWeight;
-
-    // Giảm độ tự tin khi dữ liệu chưa đủ
-    const reliability = count / (count + 30);
-
-    probability = 0.5 +
-        (probability - 0.5) * reliability;
-
-    const side = probability >= 0.5
+    map.set(id, {
+      id,
+      result: result === 'TAI'
         ? 't'
-        : 'x';
+        : 'x',
+      dices,
+      point
+    });
+  }
 
-    const confidence = Math.max(
-        probability,
-        1 - probability
-    ) * 100;
-
-    return {
-        side,
-        confidence,
-        probabilityTai: probability
-    };
-}
-
-// Lưu cố định dự đoán trước khi có kết quả
-function getPrediction(sessionId) {
-    const key = String(sessionId);
-
-    if (!db.predictions[key]) {
-        db.predictions[key] = predict(
-            db.sequence
-        );
-    }
-
-    return db.predictions[key];
+  return [...map.values()].sort(
+    (a, b) => a.id - b.id
+  );
 }
 
 // ==========================================
-// API DATA PARSER
+// NEW SESSION PROCESSING
 // ==========================================
 
-function parseSessions(payload) {
-    if (!Array.isArray(payload.list)) {
-        throw new Error(
-            'API schema error: expected list'
-        );
+function apply(sessions) {
+  const last =
+    db.history.at(-1)?.id || 0;
+
+  const incoming = sessions.filter(
+    r => r.id > last
+  );
+
+  // Không có kết quả mới: im lặng
+
+  if (
+    !incoming.length &&
+    (
+      !last ||
+      db.predictions[String(last + 1)]
+    )
+  ) {
+    return false;
+  }
+
+  const next = {
+    ...db,
+    history: [...db.history],
+    predictions: { ...db.predictions },
+    statistics: [...db.statistics]
+  };
+
+  for (const r of incoming) {
+    const old =
+      next.predictions[String(r.id)];
+
+    // Chỉ chấm dự đoán đã được lưu từ trước
+
+    if (old) {
+      next.statistics.push({
+        id: r.id,
+        predicted: old.side,
+        actual: r.result,
+        confidence: old.confidence,
+        correct: old.side === r.result
+      });
     }
 
-    const sessions = new Map();
+    next.history.push(r);
+  }
 
-    for (const item of payload.list) {
-        const id = Number(item.id);
+  // FIFO: giới hạn 200 phiên
 
-        const rawResult =
-            item.resultTruyenThong;
+  next.history = next.history.slice(-MAX);
 
-        if (
-            !Number.isSafeInteger(id) ||
-            id <= 0
-        ) {
-            continue;
-        }
+  const latest = next.history.at(-1).id;
 
-        if (
-            rawResult !== 'TAI' &&
-            rawResult !== 'XIU'
-        ) {
-            continue;
-        }
-
-        const dices = Array.isArray(item.dices)
-            ? item.dices.map(Number)
-            : String(item.dices ?? '')
-                .split(/[-,\s]+/)
-                .map(Number);
-
-        if (
-            dices.length !== 3 ||
-            !dices.every(d =>
-                Number.isInteger(d) &&
-                d >= 1 &&
-                d <= 6
-            )
-        ) {
-            continue;
-        }
-
-        const point = Number(item.point);
-
-        const diceTotal = dices.reduce(
-            (a, b) => a + b,
-            0
-        );
-
-        if (point !== diceTotal) {
-            continue;
-        }
-
-        sessions.set(id, {
-            id,
-            result: rawResult === 'TAI'
-                ? 't'
-                : 'x',
-            dices,
-            point
-        });
+  for (const key of Object.keys(
+    next.predictions
+  )) {
+    if (Number(key) <= latest) {
+      delete next.predictions[key];
     }
+  }
 
-    return [...sessions.values()]
-        .sort((a, b) => a.id - b.id);
+  const key = String(latest + 1);
+
+  // Cố định dự đoán cho phiên tiếp theo
+
+  if (!next.predictions[key]) {
+    next.predictions[key] = predict(
+      contiguous(next.history)
+    );
+  }
+
+  commit(next);
+
+  if (incoming.length) {
+    console.log(
+      '[NEW]',
+      latest,
+      name(next.predictions[key].side),
+      pct(next.predictions[key].confidence)
+    );
+  }
+
+  return true;
 }
 
 // ==========================================
-// FETCH API
+// AUTO FETCH SOURCE API
 // ==========================================
 
-async function fetchSessions() {
-    const response = await fetch(API_URL, {
-        method: 'GET',
-        headers: {
-            'Accept': 'application/json'
-        },
-        signal: AbortSignal.timeout(4500)
+let lastSuccess = 0;
+let lastError = false;
+
+async function poll() {
+  try {
+    const res = await fetch(API_URL, {
+      headers: {
+        Accept: 'application/json'
+      },
+
+      signal: AbortSignal.timeout(4500)
     });
 
-    if (!response.ok) {
-        throw new Error(
-            `API HTTP ${response.status}`
-        );
+    if (!res.ok) {
+      throw new Error(
+        'HTTP ' + res.status
+      );
     }
 
-    const payload = await response.json();
-
-    return parseSessions(payload);
-}
-
-// ==========================================
-// TIME GMT+7
-// ==========================================
-
-function vietnamTime() {
-    return new Date(
-        Date.now() + 7 * 60 * 60 * 1000
-    )
-        .toISOString()
-        .replace('Z', '+07:00');
-}
-
-function resultName(side) {
-    return side === 't' ? 'tai' : 'xiu';
-}
-
-let lastSuccess = null;
-
-// ==========================================
-// CHECK NEW SESSION
-// ==========================================
-
-async function checkAPI() {
-    const sessions = await fetchSessions();
+    const sessions = parse(
+      await res.json()
+    );
 
     if (!sessions.length) {
-        throw new Error(
-            'Khong co phien hop le'
-        );
+      throw new Error(
+        'No valid sessions'
+      );
     }
 
-    // Lần đầu khởi động
-    if (!db.history.length) {
-        db.history = sessions.slice(
-            -MAX_HISTORY
-        );
+    apply(sessions);
 
-        saveDatabase();
+    lastSuccess = Date.now();
+    lastError = false;
 
-        const latest = db.history.at(-1);
+  } catch (e) {
+    lastError = true;
 
-        getPrediction(latest.id + 1);
-
-        saveDatabase();
-
-        console.log(
-            `[INIT] Loaded ${db.history.length} sessions`
-        );
-
-        return;
-    }
-
-    const lastId = db.history.at(-1).id;
-
-    const newSessions = sessions.filter(
-        item => item.id > lastId
+    console.error(
+      '[POLL ERROR]',
+      e.message
     );
-
-    // Không có phiên mới: im lặng
-    if (!newSessions.length) {
-        return;
-    }
-
-    for (const item of newSessions) {
-        const oldPrediction =
-            db.predictions[String(item.id)];
-
-        if (oldPrediction) {
-            const correct =
-                oldPrediction.side === item.result;
-
-            db.statistics.push({
-                id: item.id,
-                predicted: oldPrediction.side,
-                actual: item.result,
-                correct,
-                confidence: oldPrediction.confidence
-            });
-
-            console.log(
-                `[CHECK] #${item.id} ` +
-                (correct ? 'DUNG' : 'SAI')
-            );
-        }
-
-        db.history.push(item);
-    }
-
-    const latest = newSessions.at(-1);
-
-    // Xóa dự đoán đã hết hạn
-    for (const key of Object.keys(
-        db.predictions
-    )) {
-        if (Number(key) <= latest.id) {
-            delete db.predictions[key];
-        }
-    }
-
-    // Giới hạn lịch sử 200 phiên
-    saveDatabase();
-
-    // Dự đoán phiên tiếp theo
-    const prediction = getPrediction(
-        latest.id + 1
-    );
-
-    saveDatabase();
-
-    console.log(
-        '================================'
-    );
-
-    console.log(
-        `[NEW] Phien: #${latest.id}`
-    );
-
-    console.log(
-        `[RESULT] ${resultName(latest.result)}`
-    );
-
-    console.log(
-        `[PREDICT] #${latest.id + 1}: ` +
-        resultName(prediction.side)
-    );
-
-    console.log(
-        `[CONFIDENCE] ` +
-        prediction.confidence.toFixed(2) + '%'
-    );
-
-    console.log(
-        `[HISTORY] ${db.history.length}/200`
-    );
-
-    console.log(
-        '================================'
-    );
+  }
 }
 
 // ==========================================
-// JSON RESPONSE
+// API OUTPUT
 // ==========================================
 
-function getAPIResponse() {
-    const latest = db.history.at(-1);
+function output() {
+  const r = db.history.at(-1);
 
-    if (!latest) {
-        return null;
-    }
+  const p = r &&
+    db.predictions[String(r.id + 1)];
 
-    const prediction = getPrediction(
-        latest.id + 1
-    );
+  if (!r || !p) {
+    return null;
+  }
 
-    return {
-        id: API_ID,
-
-        phienhientai: latest.id,
-
-        ketqua: resultName(latest.result),
-
-        xucxac: latest.dices,
-
-        tong: latest.point,
-
-        dudoanphien: latest.id + 1,
-
-        dudoan: resultName(prediction.side),
-
-        dotincay:
-            prediction.confidence.toFixed(2) + '%',
-
-        uptime: vietnamTime()
-    };
+  return {
+    id: API_ID,
+    phienhientai: r.id,
+    ketqua: name(r.result),
+    xucxac: r.dices,
+    tong: r.point,
+    dudoanphien: r.id + 1,
+    dudoan: name(p.side),
+    dotincay: pct(p.confidence),
+    uptime: vnTime()
+  };
 }
 
 // ==========================================
-// EXPRESS ROUTES
+// CUSTOM BEAUTIFUL JSON FORMAT
 // ==========================================
 
-// API chính
+// Giữ mảng xúc xắc trên cùng một dòng:
+// "xucxac": [6, 4, 4]
+
+function pretty(data) {
+  return '{\n' +
+
+    Object.entries(data).map(
+      ([k, v]) =>
+        '  ' +
+        JSON.stringify(k) +
+        ': ' +
+
+        (
+          Array.isArray(v)
+
+            ? '[' +
+              v.map(x =>
+                JSON.stringify(x)
+              ).join(', ') +
+              ']'
+
+            : JSON.stringify(v)
+        )
+
+    ).join(',\n') +
+
+    '\n}';
+}
+
+// ==========================================
+// MAIN API ROUTES
+// ==========================================
+
 app.get(['/', '/api'], (req, res) => {
-    const data = getAPIResponse();
+  const data = output();
 
-    if (!data) {
-        return res.status(503).json({
-            error: 'Dang cho du lieu API'
-        });
-    }
-
-    return res.json(data);
-});
-
-// Thống kê 10 dự đoán gần nhất
-app.get('/thongke', (req, res) => {
-    const records = db.statistics.slice(-10);
-
-    const wins = records.filter(
-        item => item.correct
-    ).length;
-
-    const losses = records.length - wins;
-
-    return res.json({
-        id: API_ID,
-
-        sophien: records.length,
-
-        dung: wins,
-
-        sai: losses,
-
-        tyle: records.length
-            ? (
-                wins / records.length * 100
-            ).toFixed(2) + '%'
-            : null,
-
-        chuoi: records.map(
-            item => item.correct ? 'W' : 'L'
-        ).join(''),
-
-        chitiet: records.map(item => ({
-            phien: item.id,
-
-            dudoan: resultName(
-                item.predicted
-            ),
-
-            ketqua: resultName(
-                item.actual
-            ),
-
-            trangthai: item.correct
-                ? 'DUNG'
-                : 'SAI',
-
-            dotincay:
-                item.confidence.toFixed(2) + '%'
-        }))
+  if (!data) {
+    return res.status(503).json({
+      error: 'Dang cho du lieu API'
     });
+  }
+
+  return res
+    .type('application/json')
+    .send(pretty(data));
 });
 
-// Lịch sử 200 phiên
+// ==========================================
+// HISTORY ENDPOINT
+// ==========================================
+
 app.get('/lichsu', (req, res) => {
-    return res.json({
-        id: API_ID,
-
-        sophien: db.history.length,
-
-        max: MAX_HISTORY,
-
-        chuoi: db.sequence,
-
-        history: db.history
-    });
+  return res.json({
+    id: API_ID,
+    sophien: db.history.length,
+    max: MAX,
+    chuoi: db.sequence,
+    history: db.history
+  });
 });
 
-// Kiểm tra trạng thái
+// ==========================================
+// STATISTICS ENDPOINT
+// ==========================================
+
+app.get('/thongke', (req, res) => {
+  const rows = db.statistics.slice(-10);
+
+  const wins = rows.filter(
+    r => r.correct
+  ).length;
+
+  return res.json({
+    id: API_ID,
+
+    sophien: rows.length,
+
+    dung: wins,
+
+    sai: rows.length - wins,
+
+    tyle: rows.length
+      ? pct(100 * wins / rows.length)
+      : null,
+
+    chuoi: rows.map(
+      r => r.correct ? 'W' : 'L'
+    ).join(''),
+
+    chitiet: rows.map(r => ({
+      phien: r.id,
+
+      dudoan: name(r.predicted),
+
+      ketqua: name(r.actual),
+
+      trangthai: r.correct
+        ? 'DUNG'
+        : 'SAI',
+
+      dotincay: pct(r.confidence)
+    }))
+  });
+});
+
+// ==========================================
+// SERVER HEALTH
+// ==========================================
+
 app.get('/health', (req, res) => {
-    return res.json({
-        status: lastSuccess
-            ? 'online'
-            : 'waiting',
+  return res.json({
+    status:
+      lastError ||
+      (
+        lastSuccess &&
+        Date.now() - lastSuccess > 15000
+      )
 
-        lastSuccess,
+        ? 'degraded'
 
-        history: db.history.length,
+        : lastSuccess
+          ? 'online'
+          : 'waiting',
 
-        uptime: process.uptime()
-    });
+    lastSuccess: lastSuccess
+
+      ? new Date(
+          lastSuccess + 25200000
+        ).toISOString()
+         .replace('Z', '+07:00')
+
+      : null,
+
+    history: db.history.length,
+
+    uptime: process.uptime()
+  });
 });
 
 // ==========================================
-// AUTO LOOP EVERY 5 SECONDS
+// NON-OVERLAPPING AUTO LOOP
 // ==========================================
 
-function sleep(ms) {
-    return new Promise(
-        resolve => setTimeout(resolve, ms)
-    );
-}
+async function loop() {
+  const started = Date.now();
 
-async function autoLoop() {
-    while (true) {
-        const started = Date.now();
+  await poll();
 
-        try {
-            await checkAPI();
-
-            lastSuccess = vietnamTime();
-
-        } catch (error) {
-            console.error(
-                '[API ERROR]',
-                error.message
-            );
-        }
-
-        const elapsed = Date.now() - started;
-
-        await sleep(
-            Math.max(
-                0,
-                CHECK_INTERVAL - elapsed
-            )
-        );
-    }
+  setTimeout(
+    loop,
+    Math.max(
+      0,
+      INTERVAL - (Date.now() - started)
+    )
+  );
 }
 
 // ==========================================
 // START SERVER
 // ==========================================
 
-app.listen(PORT, '0.0.0.0', () => {
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(
-        '================================'
+      '================================'
     );
 
-    console.log(
-        'LC79 MD5 API ONLINE'
-    );
+    console.log('LC79 MD5 API ONLINE');
+    console.log('PORT:', PORT);
+    console.log('API ID:', API_ID);
+    console.log('MODELS:', models.length);
+    console.log('MAX HISTORY:', MAX);
+    console.log('CHECK INTERVAL: 5s');
+    console.log('RANDOM: DISABLED');
 
     console.log(
-        `PORT: ${PORT}`
+      '================================'
     );
 
-    console.log(
-        `API ID: ${API_ID}`
-    );
+    loop();
+  });
+}
 
-    console.log(
-        'CHECK INTERVAL: 5000ms'
-    );
-
-    console.log(
-        'MAX HISTORY: 200'
-    );
-
-    console.log(
-        'MODELS: 9'
-    );
-
-    console.log(
-        '================================'
-    );
-
-    autoLoop();
-});
+module.exports = {
+  predict,
+  parse,
+  pretty,
+  apply,
+  output
+};
