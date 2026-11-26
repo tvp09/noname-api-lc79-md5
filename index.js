@@ -23,7 +23,7 @@ const FILE = path.join(
 const MAX = 200;
 const WINDOW = 60;
 const INTERVAL = 5000;
-const VERSION = 'six-points-v3';
+const VERSION = 'six-points-v4';
 
 const app = express();
 
@@ -157,7 +157,7 @@ function recent(h, start) {
 
 // ==========================================
 // ALGORITHM 01
-// ADAPTIVE BAYESIAN ESTIMATION
+// BAYESIAN ESTIMATION
 // ==========================================
 
 function bayesian(s) {
@@ -264,8 +264,6 @@ function variableMarkov(s) {
 // ALGORITHM 05
 // ADAPTIVE RUN LENGTH ANALYSIS
 // ==========================================
-
-// Phan tich cau bet va cau dut
 
 function runLength(s) {
   if (s.length < 2) {
@@ -470,7 +468,7 @@ const models = [
 ];
 
 // ==========================================
-// ADAPTIVE WEIGHTED SCORING V3
+// ADAPTIVE WEIGHTED SCORING V4
 // ==========================================
 
 function predict(input) {
@@ -484,10 +482,10 @@ function predict(input) {
 
   const gains = models.map(() => 0);
 
-  const forget = 2 ** (-1 / 20);
+  const forget = 2 ** (-1 / 15);
 
-  let ensembleGain = 0;
   let effective = 0;
+  let ensembleGain = 0;
 
   // ========================================
   // ADAPTIVE MODEL WEIGHTS
@@ -497,13 +495,13 @@ function predict(input) {
     const raw = gains.map(g =>
       Math.exp(
         Math.max(
-          -8,
-          Math.min(8, g / 2)
+          -5,
+          Math.min(5, g)
         )
       )
     );
 
-    const total = 6 + raw.reduce(
+    const total = raw.reduce(
       (a, b) => a + b,
       0
     );
@@ -517,9 +515,8 @@ function predict(input) {
   // WALK FORWARD VALIDATION
   // ========================================
 
-  // Danh gia tung mo hinh bang du lieu
-  // da xuat hien truoc phien kiem tra.
-  // Khong su dung du lieu tuong lai.
+  // Kiem nghiem tung mo hinh
+  // Khong su dung du lieu tuong lai
 
   for (let i = 4; i < s.length; i++) {
     const prefix = s.slice(0, i);
@@ -527,15 +524,15 @@ function predict(input) {
     const actual = s[i] === 't';
 
     const values = models.map(
-      m => clip(m(prefix))
+      model => clip(model(prefix))
     );
 
     const weights = weightsFor();
 
-    const p = clip(
-      0.5 + values.reduce(
-        (a, v, j) =>
-          a + weights[j] * (v - 0.5),
+    const combined = clip(
+      values.reduce(
+        (sum, p, j) =>
+          sum + p * weights[j],
         0
       )
     );
@@ -543,57 +540,47 @@ function predict(input) {
     ensembleGain =
       forget * ensembleGain +
       Math.log(
-        2 * (actual ? p : 1 - p)
+        2 * (
+          actual
+            ? combined
+            : 1 - combined
+        )
       );
 
     effective =
       forget * effective + 1;
 
-    // Mo hinh sai bi giam trong so
-    // Mo hinh tot duoc tang trong so
+    // Cap nhat hieu suat mo hinh
 
-    values.forEach((v, j) => {
+    values.forEach((p, j) => {
       gains[j] =
         forget * gains[j] +
         Math.log(
-          2 * (actual ? v : 1 - v)
+          2 * (actual ? p : 1 - p)
         );
     });
   }
 
   // ========================================
-  // STATISTICAL RELIABILITY
+  // SYMMETRIC MODEL POINT SCORING
   // ========================================
-
-  const gain = Math.max(
-    0,
-    ensembleGain
-  );
-
-  const reliability =
-    effective / (effective + 10) *
-    (
-      0.2 +
-      0.8 * gain / (gain + 2)
-    );
 
   const weights = weightsFor();
 
   let taiPoints = 0;
   let xiuPoints = 0;
 
-  // ========================================
-  // MODEL POINT SCORING
-  // ========================================
-
   const modelPoints = models.map(
     (model, i) => {
+
       const p = clip(model(s));
 
+      const weight = weights[i];
+
+      const signal = 2 * p - 1;
+
       const signed =
-        100 *
-        weights[i] *
-        (2 * p - 1);
+        100 * weight * signal;
 
       const tai = Math.max(
         0,
@@ -610,9 +597,15 @@ function predict(input) {
 
       return {
         model: model.name,
+
+        probabilityTai: p,
+
+        weight,
+
         tai,
+
         xiu,
-        weight: weights[i],
+
         gain: gains[i]
       };
     }
@@ -622,33 +615,71 @@ function predict(input) {
   // FINAL DECISION
   // ========================================
 
-  const net = taiPoints - xiuPoints;
+  const net =
+    taiPoints - xiuPoints;
 
-  const side =
-    net >= 0 ? 't' : 'x';
+  let side;
+
+  if (Math.abs(net) > 1e-10) {
+    side = net > 0 ? 't' : 'x';
+
+  } else {
+
+    // Xu ly hoa diem doi xung
+    // Khong mang y nghia du bao
+
+    side =
+      s.at(-1) === 't'
+        ? 'x'
+        : 't';
+  }
+
+  // ========================================
+  // SIGNAL STRENGTH
+  // ========================================
 
   const strength = Math.min(
     1,
-    Math.abs(net) / 100 *
-    reliability
+    Math.abs(net) / 100
   );
 
+  const evidence =
+    effective / (effective + 6);
+
+  const gain = Math.max(
+    0,
+    ensembleGain
+  );
+
+  const reliability =
+    evidence *
+    gain / (gain + 2);
+
   // ========================================
-  // SIGNAL SCORE 51-99%
-  // INTEGER ONLY
+  // SMOOTH SIGNAL SCORE 51-99%
   // ========================================
 
-  // Day la diem tin hieu mo hinh,
-  // khong phai xac suat thang thuc te.
+  // Diem tin hieu phi tuyen
+  // Khong phai xac suat thang thuc te
+
+  const smooth =
+    (1 - Math.exp(-3 * strength)) /
+    (1 - Math.exp(-3));
 
   const confidence = Math.max(
     51,
     Math.min(
       99,
       Math.round(
-        51 + 48 * strength
+        51 + 48 * smooth * evidence
       )
     )
+  );
+
+  // Xac suat uoc luong rieng
+
+  const probabilityTai = clip(
+    0.5 + net / 200 * reliability
   );
 
   return {
@@ -658,8 +689,7 @@ function predict(input) {
 
     scoreType: 'model_signal_score',
 
-    probabilityTai:
-      0.5 + net * reliability / 200,
+    probabilityTai,
 
     taiPoints,
 
@@ -809,10 +839,13 @@ function apply(sessions) {
     next.modelVersion = VERSION;
 
     // Giu lai du lieu moi da tich luy
-    // tu phien ban V2
+    // Tu phien ban V2 hoac V3
 
     next.modelStart =
-      db.modelVersion === 'six-points-v2' &&
+      [
+        'six-points-v2',
+        'six-points-v3'
+      ].includes(db.modelVersion) &&
       Number.isSafeInteger(db.modelStart)
 
         ? db.modelStart
@@ -869,6 +902,7 @@ function apply(sessions) {
       console.log(
         '[CHECK]',
         r.id,
+
         old.side === r.result
           ? 'DUNG'
           : 'SAI'
@@ -896,8 +930,8 @@ function apply(sessions) {
   // GENERATE NEXT PREDICTION
   // ========================================
 
-  // Giu nguyen du doan da cong bo.
-  // Chi tao du doan moi khi co phien moi.
+  // Giu nguyen du doan da cong bo
+  // Chi tao du doan moi khi co phien moi
 
   next.predictions = {
     [key]: pending || predict(
