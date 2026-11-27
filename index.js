@@ -5,6 +5,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
 
+// ==========================================
+// CONFIGURATION
+// ==========================================
+
 const PORT = process.env.PORT || 3000;
 const API_ID = process.env.API_ID || 'noname09';
 
@@ -16,8 +20,26 @@ const FILE = path.join(
   'lichsulc79md5.json'
 );
 
+// Bat dau du doan tu 15 phien.
+// Tich luy toi da 200 phien.
+// Phien 201 xoa phien cu nhat.
+
 const MAX = 200;
+const MIN_WINDOW = 15;
+const WINDOW = 200;
+
+const WINDOWS = [
+  15,
+  30,
+  60,
+  80,
+  100,
+  150,
+  200
+];
+
 const INTERVAL = 5000;
+const VERSION = 'six-points-v7';
 
 const app = express();
 
@@ -51,16 +73,25 @@ const scorePct = p =>
 const sequence = h =>
   h.map(r => r.result).join('');
 
+const clip = p =>
+  Math.max(0.001, Math.min(0.999, p));
+
+const beta = (t, n, a = 3) =>
+  (t + a) / (n + 2 * a);
+
+const countT = s =>
+  [...s].filter(c => c === 't').length;
+
+// ==========================================
+// DATABASE ENGINE
+// ==========================================
+
 const empty = () => ({
   history: [],
   sequence: '',
   predictions: {},
   statistics: []
 });
-
-// ==========================================
-// DATABASE ENGINE
-// ==========================================
 
 function load() {
   if (!fs.existsSync(FILE)) {
@@ -91,7 +122,15 @@ function load() {
 
 let db = load();
 
+// ==========================================
+// FIFO STORAGE - MAX 200 SESSIONS
+// ==========================================
+
 function commit(next) {
+
+  // Chi giu 200 phien moi nhat.
+  // Tu phien 201 tu dong xoa phien cu.
+
   next.history = next.history.slice(-MAX);
 
   next.sequence = sequence(next.history);
@@ -116,23 +155,8 @@ function commit(next) {
 }
 
 // ==========================================
-// PREDICTION CONFIGURATION
-// ==========================================
-
-const WINDOW = 60;
-const VERSION = 'six-points-v5';
-
-const clip = p =>
-  Math.max(0.001, Math.min(0.999, p));
-
-const beta = (t, n, a = 3) =>
-  (t + a) / (n + 2 * a);
-
-const countT = s =>
-  [...s].filter(c => c === 't').length;
-
-// ==========================================
 // RECENT DATA FILTER
+// MINIMUM 15 - MAXIMUM 200 SESSIONS
 // ==========================================
 
 function recent(h, start) {
@@ -177,9 +201,9 @@ function ewma(s) {
   let n = 0;
 
   for (let i = 0; i < s.length; i++) {
-    const w = 2 ** (
-      -(s.length - 1 - i) / 8
-    );
+    const age = s.length - 1 - i;
+
+    const w = 2 ** (-age / 8);
 
     t += w * Number(s[i] === 't');
     n += w;
@@ -242,14 +266,12 @@ function markov(s) {
 function variableMarkov(s) {
   let p = 0.5;
 
-  // Mau hiem khong lan at mau
-  // co nhieu bang chung.
+  const maxOrder = Math.min(
+    6,
+    s.length - 1
+  );
 
-  for (
-    let k = 1;
-    k <= Math.min(6, s.length - 1);
-    k++
-  ) {
+  for (let k = 1; k <= maxOrder; k++) {
     const [t, n] = contextCounts(s, k);
 
     const prior = 5 + k;
@@ -286,9 +308,6 @@ function runLength(s) {
   let t = 0;
   let n = 0;
   let run = 0;
-
-  // Bo doan bet dau tien vi co the
-  // da bat dau truoc cua so du lieu.
 
   let knownStart = false;
 
@@ -364,8 +383,6 @@ function patternRecognition(s) {
 
     let primitive = true;
 
-    // Loai bo chu ky trung lap
-
     for (let d = 1; d < period; d++) {
       if (
         period % d === 0 &&
@@ -381,8 +398,6 @@ function patternRecognition(s) {
     if (!primitive) {
       continue;
     }
-
-    // Tim do dai chu ky hien tai
 
     let span = period;
 
@@ -403,8 +418,6 @@ function patternRecognition(s) {
       2 * period + 2,
       len - 1
     );
-
-    // So khop mau cau nhieu pha
 
     for (
       let k = period + 1;
@@ -429,9 +442,6 @@ function patternRecognition(s) {
         const w =
           quality *
           2 ** (-(len - 1 - j) / 18);
-
-        // Moi ket qua chi duoc
-        // cong diem mot lan.
 
         hits.set(
           j,
@@ -472,113 +482,208 @@ const models = [
 ];
 
 // ==========================================
-// ADAPTIVE WEIGHTED SCORING V5
+// MULTI WINDOW ADAPTIVE SCORING V7
 // ==========================================
 
 function predict(input) {
   const s = input.slice(-WINDOW);
 
-  if (!s.length || /[^tx]/.test(s)) {
+  if (/[^tx]/.test(s)) {
     throw new Error(
       'Invalid T/X sequence'
     );
   }
 
-  const gains = models.map(() => 0);
+  // Bat dau du doan ngay khi du 15 phien.
 
-  const forget = 2 ** (-1 / 15);
-
-  let ensembleGain = 0;
-  let effective = 0;
-
-  // ========================================
-  // ADAPTIVE MODEL WEIGHTS
-  // ========================================
-
-  function weightsFor() {
-    const raw = gains.map(g =>
-      Math.exp(
-        Math.max(
-          -6,
-          Math.min(6, g)
-        )
-      )
-    );
-
-    const total = raw.reduce(
-      (a, b) => a + b,
-      0
-    );
-
-    return raw.map(
-      w => w / total
-    );
+  if (s.length < MIN_WINDOW) {
+    return null;
   }
+
+  // Tu dong mo rong cua so phan tich
+  // theo so luong phien hien co.
+
+  const windows = WINDOWS.filter(
+    w => w <= s.length
+  );
+
+  if (!windows.includes(s.length)) {
+    windows.push(s.length);
+  }
+
+  const forget = 2 ** (-1 / 30);
+
+  const states = models.map(model => ({
+    model,
+
+    windows: windows.map(size => ({
+      size,
+      gain: 0,
+      count: 0
+    }))
+  }));
 
   // ========================================
   // WALK FORWARD VALIDATION
   // ========================================
 
-  // Danh gia hieu suat tung mo hinh
-  // Khong su dung du lieu tuong lai
+  // Bat dau kiem nghiem tu phien thu 8
+  // de hoat dong khi chi co 15 phien.
 
-  for (let i = 4; i < s.length; i++) {
-    const values = models.map(
-      m => clip(
-        m(s.slice(0, i))
-      )
-    );
-
-    const weights = weightsFor();
-
+  for (let i = 8; i < s.length; i++) {
     const actual = s[i] === 't';
 
-    const p = clip(
-      values.reduce(
-        (a, v, j) =>
-          a + v * weights[j],
-        0
-      )
+    for (const state of states) {
+      for (const item of state.windows) {
+
+        const prefix = s.slice(
+          Math.max(0, i - item.size),
+          i
+        );
+
+        const p = clip(
+          state.model(prefix)
+        );
+
+        const likelihood =
+          actual ? p : 1 - p;
+
+        item.gain =
+          forget * item.gain +
+          Math.log(2 * likelihood);
+
+        item.count =
+          forget * item.count + 1;
+      }
+    }
+  }
+
+  // ========================================
+  // ADAPTIVE WINDOW EVALUATION
+  // ========================================
+
+  const evaluated = states.map(state => {
+
+    const candidates = state.windows.map(
+      item => {
+
+        const data = s.slice(
+          -item.size
+        );
+
+        const p = clip(
+          state.model(data)
+        );
+
+        const quality =
+          item.gain /
+          (item.count + 8);
+
+        const weight = Math.exp(
+          Math.max(
+            -5,
+            Math.min(
+              5,
+              quality * 12
+            )
+          )
+        );
+
+        return {
+          size: item.size,
+          p,
+          quality,
+          weight
+        };
+      }
     );
 
-    ensembleGain =
-      forget * ensembleGain +
-      Math.log(
-        2 * (actual ? p : 1 - p)
+    const total = candidates.reduce(
+      (sum, item) =>
+        sum + item.weight,
+      0
+    );
+
+    const probability =
+      candidates.reduce(
+        (sum, item) =>
+          sum +
+          item.p *
+          item.weight / total,
+        0
       );
 
-    effective =
-      forget * effective + 1;
+    const quality =
+      candidates.reduce(
+        (sum, item) =>
+          sum +
+          item.quality *
+          item.weight / total,
+        0
+      );
 
-    // Mo hinh sai giam diem.
-    // Mo hinh tot tang diem.
+    return {
+      model: state.model.name,
 
-    values.forEach((v, j) => {
-      gains[j] =
-        forget * gains[j] +
-        Math.log(
-          2 * (actual ? v : 1 - v)
-        );
-    });
-  }
+      probability,
+
+      quality,
+
+      windows: candidates.map(
+        item => ({
+          size: item.size,
+
+          probabilityTai: item.p,
+
+          quality: item.quality,
+
+          weight:
+            item.weight / total
+        })
+      )
+    };
+  });
+
+  // ========================================
+  // ADAPTIVE MODEL WEIGHTS
+  // ========================================
+
+  const rawWeights = evaluated.map(
+    item => Math.exp(
+      Math.max(
+        -5,
+        Math.min(
+          5,
+          item.quality * 12
+        )
+      )
+    )
+  );
+
+  const totalWeight = rawWeights.reduce(
+    (sum, w) => sum + w,
+    0
+  );
+
+  let taiPoints = 0;
+  let xiuPoints = 0;
 
   // ========================================
   // SYMMETRIC MODEL POINT SCORING
   // ========================================
 
-  const weights = weightsFor();
+  const modelPoints = evaluated.map(
+    (item, index) => {
 
-  let taiPoints = 0;
-  let xiuPoints = 0;
+      const weight =
+        rawWeights[index] /
+        totalWeight;
 
-  const modelPoints = models.map(
-    (m, j) => {
-      const p = clip(m(s));
+      const signal =
+        2 * item.probability - 1;
 
       const signed =
-        100 *
-        weights[j] *
-        (2 * p - 1);
+        100 * weight * signal;
 
       const tai = Math.max(
         0,
@@ -594,11 +699,20 @@ function predict(input) {
       xiuPoints += xiu;
 
       return {
-        model: m.name,
+        model: item.model,
+
+        probabilityTai:
+          item.probability,
+
+        weight,
+
+        quality: item.quality,
+
         tai,
+
         xiu,
-        weight: weights[j],
-        gain: gains[j]
+
+        windows: item.windows
       };
     }
   );
@@ -618,34 +732,61 @@ function predict(input) {
       : (s.at(-1) === 't' ? 'x' : 't');
 
   // ========================================
-  // SIGNAL SCORE 51-99%
-  // INTEGER ONLY
+  // MODEL QUALITY
   // ========================================
+
+  const quality = modelPoints.reduce(
+    (sum, item) =>
+      sum +
+      item.quality *
+      item.weight,
+    0
+  );
 
   const strength = Math.min(
     1,
     Math.abs(net) / 100
   );
 
-  const confidence = Math.round(
-    51 + 48 * strength
+  // ========================================
+  // NONLINEAR SIGNAL SCORE 51-99%
+  // ========================================
+
+  // Giu nguyen cong thuc V6.
+  // Khong random.
+  // Diem tin hieu khong phai xac suat thang.
+
+  const smooth =
+    Math.log1p(4 * strength) /
+    Math.log(5);
+
+  const confidence = Math.max(
+    51,
+    Math.min(
+      99,
+      Math.round(
+        51 + 48 * smooth
+      )
+    )
   );
 
   // ========================================
   // STATISTICAL RELIABILITY
   // ========================================
 
-  const gain = Math.max(
+  const positiveQuality = Math.max(
     0,
-    ensembleGain
+    quality
   );
 
   const reliability =
-    effective / (effective + 6) *
-    gain / (gain + 2);
+    positiveQuality /
+    (positiveQuality + 0.05);
 
-  // Diem tin hieu khong phai
-  // xac suat thang thuc te.
+  const probabilityTai = clip(
+    0.5 +
+    net * reliability / 200
+  );
 
   return {
     side,
@@ -654,9 +795,7 @@ function predict(input) {
 
     scoreType: 'model_signal_score',
 
-    probabilityTai: clip(
-      0.5 + net * reliability / 200
-    ),
+    probabilityTai,
 
     taiPoints,
 
@@ -664,11 +803,11 @@ function predict(input) {
 
     modelPoints,
 
-    ensembleGain,
+    reliability,
 
-    effective,
+    analyzedSessions: s.length,
 
-    reliability
+    analysisWindows: windows
   };
 }
 
@@ -779,11 +918,7 @@ function apply(sessions) {
   // Khong co phien moi
   // thi khong tinh lai du doan.
 
-  if (
-    !migration &&
-    !incoming.length &&
-    db.predictions[String(last + 1)]
-  ) {
+  if (!migration && !incoming.length) {
     return false;
   }
 
@@ -806,14 +941,16 @@ function apply(sessions) {
   if (migration) {
     next.modelVersion = VERSION;
 
-    // Giu lai du lieu moi da tich luy
-    // tu cac phien ban V2, V3, V4.
+    // Giu du lieu da tich luy
+    // tu cac phien ban V2 den V6.
 
     next.modelStart =
       [
         'six-points-v2',
         'six-points-v3',
-        'six-points-v4'
+        'six-points-v4',
+        'six-points-v5',
+        'six-points-v6'
       ].includes(db.modelVersion) &&
       Number.isSafeInteger(db.modelStart)
 
@@ -867,12 +1004,26 @@ function apply(sessions) {
         correct:
           old.side === r.result
       });
+
+      console.log(
+        '[CHECK]',
+        r.id,
+
+        old.side === r.result
+          ? 'DUNG'
+          : 'SAI'
+      );
     }
   }
 
   // ========================================
-  // FIFO MAX 200 SESSIONS
+  // FIFO STORAGE
   // ========================================
+
+  // 15 phien: bat dau phan tich.
+  // 16-200: tiep tuc tich luy.
+  // 201: xoa phien cu nhat.
+  // Luon giu toi da 200 phien.
 
   next.history =
     next.history.slice(-MAX);
@@ -890,25 +1041,91 @@ function apply(sessions) {
   // GENERATE NEXT PREDICTION
   // ========================================
 
-  next.predictions = {
-    [key]: pending || predict(
-      recent(
-        next.history,
-        next.modelStart
-      )
-    )
-  };
+  const analysis = recent(
+    next.history,
+    next.modelStart
+  );
+
+  // Chi du doan khi co it nhat 15 phien.
+  // Giu nguyen du doan da cong bo.
+
+  const prediction =
+    analysis.length >= MIN_WINDOW
+
+      ? (pending || predict(analysis))
+
+      : null;
+
+  next.predictions = prediction
+    ? { [key]: prediction }
+    : {};
 
   commit(next);
 
-  if (incoming.length) {
+  // ========================================
+  // CONSOLE LOG
+  // ========================================
+
+  if (prediction) {
     console.log(
-      '[NEW]',
-      latest,
-      name(next.predictions[key].side),
-      scorePct(
-        next.predictions[key].confidence
+      '================================'
+    );
+
+    console.log(
+      '[PHIEN]',
+      latest
+    );
+
+    console.log(
+      '[KET QUA]',
+      name(
+        next.history.at(-1).result
       )
+    );
+
+    console.log(
+      '[DU DOAN]',
+      name(prediction.side)
+    );
+
+    console.log(
+      '[DIEM TIN HIEU]',
+      scorePct(prediction.confidence)
+    );
+
+    console.log(
+      '[DIEM TAI]',
+      prediction.taiPoints?.toFixed(4)
+    );
+
+    console.log(
+      '[DIEM XIU]',
+      prediction.xiuPoints?.toFixed(4)
+    );
+
+    console.log(
+      '[PHAN TICH]',
+      analysis.length + '/200'
+    );
+
+    console.log(
+      '[LICH SU]',
+      next.history.length + '/200'
+    );
+
+    console.log(
+      '[WINDOWS]',
+      prediction.analysisWindows
+    );
+
+    console.log(
+      '================================'
+    );
+
+  } else {
+    console.log(
+      '[WAITING]',
+      analysis.length + '/' + MIN_WINDOW
     );
   }
 
@@ -925,6 +1142,8 @@ let lastError = false;
 async function poll() {
   try {
     const res = await fetch(API_URL, {
+      method: 'GET',
+
       headers: {
         Accept: 'application/json'
       },
@@ -1108,7 +1327,7 @@ app.get('/thongke', (req, res) => {
     r => r.correct
   ).length;
 
-  res.json({
+  return res.json({
     id: API_ID,
 
     sophien: rows.length,
@@ -1211,8 +1430,24 @@ async function loop() {
 if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
-      'LC79 MD5 API ONLINE:',
-      PORT
+      '================================'
+    );
+
+    console.log('LC79 MD5 API ONLINE');
+    console.log('VERSION:', VERSION);
+    console.log('PORT:', PORT);
+    console.log('API ID:', API_ID);
+    console.log('MODELS:', models.length);
+    console.log('MIN ANALYSIS:', MIN_WINDOW);
+    console.log('MAX ANALYSIS:', WINDOW);
+    console.log('WINDOWS:', WINDOWS);
+    console.log('MAX HISTORY:', MAX);
+    console.log('STORAGE: FIFO');
+    console.log('CHECK INTERVAL: 5s');
+    console.log('RANDOM: DISABLED');
+
+    console.log(
+      '================================'
     );
 
     loop();
