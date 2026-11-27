@@ -20,26 +20,16 @@ const FILE = path.join(
   'lichsulc79md5.json'
 );
 
-// Bat dau du doan tu 15 phien.
-// Tich luy toi da 200 phien.
-// Phien 201 xoa phien cu nhat.
-
 const MAX = 200;
 const MIN_WINDOW = 15;
 const WINDOW = 200;
 
 const WINDOWS = [
-  15,
-  30,
-  60,
-  80,
-  100,
-  150,
-  200
+  15, 30, 60, 80, 100, 150, 200
 ];
 
 const INTERVAL = 5000;
-const VERSION = 'six-points-v7';
+const VERSION = 'six-points-v8';
 
 const app = express();
 
@@ -98,7 +88,7 @@ function load() {
     return empty();
   }
 
-  const data = {
+  const d = {
     ...empty(),
     ...JSON.parse(
       fs.readFileSync(FILE, 'utf8')
@@ -106,34 +96,33 @@ function load() {
   };
 
   if (
-    !Array.isArray(data.history) ||
-    !Array.isArray(data.statistics) ||
-    !data.predictions ||
-    typeof data.predictions !== 'object'
+    !Array.isArray(d.history) ||
+    !Array.isArray(d.statistics) ||
+    !d.predictions ||
+    typeof d.predictions !== 'object'
   ) {
     throw new Error('Invalid history file');
   }
 
-  data.history = data.history.slice(-MAX);
-  data.sequence = sequence(data.history);
+  d.history = d.history.slice(-MAX);
+  d.sequence = sequence(d.history);
 
-  return data;
+  return d;
 }
 
 let db = load();
 
 // ==========================================
-// FIFO STORAGE - MAX 200 SESSIONS
+// FIFO STORAGE
+// MIN 15 - MAX 200
 // ==========================================
 
 function commit(next) {
+  next.history =
+    next.history.slice(-MAX);
 
-  // Chi giu 200 phien moi nhat.
-  // Tu phien 201 tu dong xoa phien cu.
-
-  next.history = next.history.slice(-MAX);
-
-  next.sequence = sequence(next.history);
+  next.sequence =
+    sequence(next.history);
 
   next.statistics =
     next.statistics.slice(-MAX);
@@ -153,11 +142,6 @@ function commit(next) {
 
   db = next;
 }
-
-// ==========================================
-// RECENT DATA FILTER
-// MINIMUM 15 - MAXIMUM 200 SESSIONS
-// ==========================================
 
 function recent(h, start) {
   const rows = h
@@ -180,7 +164,7 @@ function recent(h, start) {
 
 // ==========================================
 // ALGORITHM 01
-// BAYESIAN ESTIMATION
+// BAYESIAN FREQUENCY
 // ==========================================
 
 function bayesian(s) {
@@ -193,7 +177,7 @@ function bayesian(s) {
 
 // ==========================================
 // ALGORITHM 02
-// EXPONENTIALLY WEIGHTED MOVING AVERAGE
+// SHORT TERM EWMA
 // ==========================================
 
 function ewma(s) {
@@ -203,7 +187,7 @@ function ewma(s) {
   for (let i = 0; i < s.length; i++) {
     const age = s.length - 1 - i;
 
-    const w = 2 ** (-age / 8);
+    const w = 2 ** (-age / 6);
 
     t += w * Number(s[i] === 't');
     n += w;
@@ -213,141 +197,176 @@ function ewma(s) {
 }
 
 // ==========================================
-// CONTEXT MATCHING CORE
+// ALGORITHM 03
+// SYMMETRIC MARKOV CHAIN
 // ==========================================
 
-function contextCounts(s, k) {
-  if (s.length <= k) {
-    return [0, 0];
+// Hoc kha nang giu cau va dao cau.
+// Khong mac dinh uu tien TAI hay XIU.
+
+function markov(s) {
+  if (s.length < 2) {
+    return 0.5;
   }
 
-  const suffix = s.slice(-k);
-
-  let t = 0;
+  let same = 0;
   let n = 0;
 
-  for (let i = 0; i + k < s.length; i++) {
-    if (s.slice(i, i + k) !== suffix) {
-      continue;
-    }
-
-    const age =
-      s.length - 1 - (i + k);
-
-    const w = 2 ** (-age / 18);
+  for (let i = 1; i < s.length; i++) {
+    const w = 2 ** (
+      -(s.length - 1 - i) / 24
+    );
 
     n += w;
 
-    t += w * Number(
-      s[i + k] === 't'
+    same += w * Number(
+      s[i] === s[i - 1]
     );
   }
 
-  return [t, n];
-}
+  const p = beta(same, n, 3);
 
-// ==========================================
-// ALGORITHM 03
-// ADAPTIVE MARKOV CHAIN
-// ==========================================
-
-function markov(s) {
-  return beta(
-    ...contextCounts(s, 1),
-    3
-  );
+  return s.at(-1) === 't'
+    ? p
+    : 1 - p;
 }
 
 // ==========================================
 // ALGORITHM 04
 // VARIABLE ORDER MARKOV
+// MIRRORED CONTEXT MATCHING
 // ==========================================
 
+// Nhan dien mau cau goc
+// va mau cau dao nguoc TAI/XIU.
+//
+// TTX tuong duong XXT
+// TTXX tuong duong XXTT
+
 function variableMarkov(s) {
+  if (s.length < 2) {
+    return 0.5;
+  }
+
+  const len = s.length;
+  const last = s.at(-1);
+
   let p = 0.5;
 
-  const maxOrder = Math.min(
-    6,
-    s.length - 1
-  );
+  for (
+    let k = 1;
+    k <= Math.min(7, len - 1);
+    k++
+  ) {
+    let same = 0;
+    let n = 0;
 
-  for (let k = 1; k <= maxOrder; k++) {
-    const [t, n] = contextCounts(s, k);
+    for (let j = k; j < len; j++) {
+      const mirror =
+        s[j - 1] !== last;
+
+      let match = true;
+
+      for (let d = 1; d <= k; d++) {
+        if (
+          (s[j - d] !== s[len - d])
+          !== mirror
+        ) {
+          match = false;
+          break;
+        }
+      }
+
+      if (!match) {
+        continue;
+      }
+
+      const w = 2 ** (
+        -(len - 1 - j) / 30
+      );
+
+      n += w;
+
+      same += w * Number(
+        s[j] === s[j - 1]
+      );
+    }
 
     const prior = 5 + k;
 
-    p = (t + prior * p) /
+    p = (same + prior * p) /
         (n + prior);
   }
 
-  return p;
+  return last === 't'
+    ? p
+    : 1 - p;
 }
 
 // ==========================================
 // ALGORITHM 05
-// ADAPTIVE RUN LENGTH ANALYSIS
+// ADAPTIVE RUN LENGTH
 // ==========================================
+
+// Phan tich do dai cau.
+// Hoc kha nang tiep tuc va chuyen cau.
+// Su dung ca cac do dai gan tuong dong.
 
 function runLength(s) {
   if (s.length < 2) {
     return 0.5;
   }
 
-  const side = s.at(-1);
+  const len = s.length;
 
   let target = 1;
 
   for (
-    let i = s.length - 2;
-    i >= 0 && s[i] === side;
+    let i = len - 2;
+    i >= 0 && s[i] === s.at(-1);
     i--
   ) {
     target++;
   }
 
-  let t = 0;
+  let run = 1;
+  let same = 0;
   let n = 0;
-  let run = 0;
+  let known = false;
 
-  let knownStart = false;
-
-  for (let i = 0; i < s.length - 1; i++) {
-    if (
-      i > 0 &&
-      s[i] !== s[i - 1]
-    ) {
-      knownStart = true;
+  for (let i = 1; i < len - 1; i++) {
+    if (s[i] !== s[i - 1]) {
       run = 1;
+      known = true;
     } else {
       run++;
     }
 
-    if (
-      !knownStart ||
-      s[i] !== side
-    ) {
+    if (!known) {
       continue;
     }
 
-    if (
-      Math.min(run, 5) !==
-      Math.min(target, 5)
-    ) {
-      continue;
-    }
-
-    const w = 2 ** (
-      -(s.length - 2 - i) / 18
+    const distance = Math.abs(
+      Math.min(run, 8) -
+      Math.min(target, 8)
     );
+
+    const w =
+      2 ** (-(len - 2 - i) / 24) *
+      2 ** (-2 * distance);
 
     n += w;
 
-    t += w * Number(
-      s[i + 1] === 't'
+    same += w * Number(
+      s[i + 1] === s[i]
     );
   }
 
-  return beta(t, n, 3);
+  const p = beta(same, n, 3);
+
+  return s.at(-1) === 't'
+    ? p
+    : 1 - p;
 }
 
 // ==========================================
@@ -355,121 +374,118 @@ function runLength(s) {
 // ADAPTIVE PATTERN RECOGNITION
 // ==========================================
 
-// Nhan dien mau cau:
-// Cau bet
-// Cau dao 1-1
+// Phan tich cac mau lap co chu ky:
+//
+// Cau 1-1
 // Cau 2-1
 // Cau 1-2
 // Cau 2-2
-// Cau 3-3
 // Cau 3-1
-// Chu ky lap tu 1 den 6
+// Cau 1-3
+// Cau 3-2
+// Cau 2-3
+// Cau 3-3
+// Cau 4-4
+//
+// Danh gia chu ky tu 2 den 8.
+// Khong bat buoc mau lap trung khop 100%.
 
 function patternRecognition(s) {
-  const hits = new Map();
-
   const len = s.length;
 
+  let weighted = 0;
+  let total = 1;
+
   for (
-    let period = 1;
-    period <= 6;
+    let period = 2;
+    period <= 8;
     period++
   ) {
-    if (len < 2 * period) {
+    if (len < 2 * period + 1) {
       continue;
     }
 
-    const block = s.slice(-period);
+    // Danh gia muc do khop
+    // cua chu ky gan nhat.
 
-    let primitive = true;
-
-    for (let d = 1; d < period; d++) {
-      if (
-        period % d === 0 &&
-        block === block
-          .slice(0, d)
-          .repeat(period / d)
-      ) {
-        primitive = false;
-        break;
-      }
-    }
-
-    if (!primitive) {
-      continue;
-    }
-
-    let span = period;
-
-    while (
-      span < len &&
-      s[len - 1 - span] ===
-      s[len - 1 - span + period]
-    ) {
-      span++;
-    }
-
-    if (span < 2 * period) {
-      continue;
-    }
-
-    const high = Math.min(
-      span,
-      2 * period + 2,
-      len - 1
+    const checks = Math.min(
+      2 * period,
+      len - period
     );
+
+    let local = 0;
 
     for (
-      let k = period + 1;
-      k <= high;
-      k++
+      let j = len - checks;
+      j < len;
+      j++
     ) {
-      const suffix = s.slice(-k);
-
-      const quality =
-        k / Math.max(
-          2 * period + 2,
-          k
-        );
-
-      for (let j = k; j < len; j++) {
-        if (
-          s.slice(j - k, j) !== suffix
-        ) {
-          continue;
-        }
-
-        const w =
-          quality *
-          2 ** (-(len - 1 - j) / 18);
-
-        hits.set(
-          j,
-          Math.max(
-            hits.get(j) || 0,
-            w
-          )
-        );
-      }
+      local += Number(
+        s[j] === s[j - period]
+      );
     }
-  }
 
-  let t = 0;
-  let n = 0;
-
-  for (const [j, w] of hits) {
-    n += w;
-
-    t += w * Number(
-      s[j] === 't'
+    const localFit = Math.max(
+      0,
+      2 * beta(local, checks, 1) - 1
     );
+
+    if (!localFit) {
+      continue;
+    }
+
+    // Kiem tra chu ky tren lich su.
+
+    let hits = 0;
+    let n = 0;
+
+    for (
+      let j = period;
+      j < len;
+      j++
+    ) {
+      const w = 2 ** (
+        -(len - 1 - j) / 30
+      );
+
+      n += w;
+
+      hits += w * Number(
+        s[j] === s[j - period]
+      );
+    }
+
+    const p = beta(hits, n, 3);
+
+    const support = Math.max(
+      0,
+      2 * p - 1
+    );
+
+    // Chi tang diem khi co ca
+    // tin hieu hien tai va ho tro lich su.
+
+    const weight =
+      localFit *
+      support *
+      n / (n + 6);
+
+    const signal =
+      s[len - period] === 't'
+        ? support
+        : -support;
+
+    weighted += weight * signal;
+    total += weight;
   }
 
-  return beta(t, n, 3);
+  return clip(
+    0.5 + weighted / (2 * total)
+  );
 }
 
 // ==========================================
-// EXACTLY SIX PREDICTION MODELS
+// EXACTLY SIX MODELS
 // ==========================================
 
 const models = [
@@ -482,7 +498,7 @@ const models = [
 ];
 
 // ==========================================
-// MULTI WINDOW ADAPTIVE SCORING V7
+// ADAPTIVE MULTI WINDOW ENGINE V8
 // ==========================================
 
 function predict(input) {
@@ -494,14 +510,11 @@ function predict(input) {
     );
   }
 
-  // Bat dau du doan ngay khi du 15 phien.
-
   if (s.length < MIN_WINDOW) {
     return null;
   }
 
-  // Tu dong mo rong cua so phan tich
-  // theo so luong phien hien co.
+  // Tu dong mo rong so phien phan tich.
 
   const windows = WINDOWS.filter(
     w => w <= s.length
@@ -511,49 +524,79 @@ function predict(input) {
     windows.push(s.length);
   }
 
-  const forget = 2 ** (-1 / 30);
-
   const states = models.map(model => ({
     model,
 
     windows: windows.map(size => ({
       size,
-      gain: 0,
-      count: 0
+      fast: 0,
+      slow: 0,
+      nf: 0,
+      ns: 0
     }))
   }));
+
+  // ========================================
+  // DUAL SPEED PERFORMANCE LEARNING
+  // ========================================
+
+  // Danh gia hieu suat ngan han
+  // va dai han cua tung mo hinh.
+
+  const fastDecay = 2 ** (-1 / 12);
+  const slowDecay = 2 ** (-1 / 40);
 
   // ========================================
   // WALK FORWARD VALIDATION
   // ========================================
 
-  // Bat dau kiem nghiem tu phien thu 8
-  // de hoat dong khi chi co 15 phien.
+  // Khong nhin truoc ket qua.
+  // So sanh mo hinh voi moc 50/50.
 
   for (let i = 8; i < s.length; i++) {
     const actual = s[i] === 't';
 
     for (const state of states) {
+
+      // Cache tranh tinh trung cac cua so.
+
+      const cache = new Map();
+
       for (const item of state.windows) {
-
-        const prefix = s.slice(
-          Math.max(0, i - item.size),
-          i
+        const size = Math.min(
+          i,
+          item.size
         );
 
-        const p = clip(
-          state.model(prefix)
+        if (!cache.has(size)) {
+          const prefix = s.slice(
+            i - size,
+            i
+          );
+
+          cache.set(
+            size,
+            clip(state.model(prefix))
+          );
+        }
+
+        const p = cache.get(size);
+
+        const gain = Math.log(
+          2 * (actual ? p : 1 - p)
         );
 
-        const likelihood =
-          actual ? p : 1 - p;
+        item.fast =
+          fastDecay * item.fast + gain;
 
-        item.gain =
-          forget * item.gain +
-          Math.log(2 * likelihood);
+        item.slow =
+          slowDecay * item.slow + gain;
 
-        item.count =
-          forget * item.count + 1;
+        item.nf =
+          fastDecay * item.nf + 1;
+
+        item.ns =
+          slowDecay * item.ns + 1;
       }
     }
   }
@@ -563,31 +606,26 @@ function predict(input) {
   // ========================================
 
   const evaluated = states.map(state => {
-
     const candidates = state.windows.map(
       item => {
-
-        const data = s.slice(
-          -item.size
-        );
-
         const p = clip(
-          state.model(data)
-        );
-
-        const quality =
-          item.gain /
-          (item.count + 8);
-
-        const weight = Math.exp(
-          Math.max(
-            -5,
-            Math.min(
-              5,
-              quality * 12
-            )
+          state.model(
+            s.slice(-item.size)
           )
         );
+
+        // 65% hieu suat gan day.
+        // 35% hieu suat dai han.
+
+        const quality =
+          0.65 *
+          item.fast / (item.nf + 8) +
+
+          0.35 *
+          item.slow / (item.ns + 12);
+
+        const weight =
+          Math.exp(12 * quality);
 
         return {
           size: item.size,
@@ -599,26 +637,22 @@ function predict(input) {
     );
 
     const total = candidates.reduce(
-      (sum, item) =>
-        sum + item.weight,
+      (a, c) => a + c.weight,
       0
     );
 
     const probability =
       candidates.reduce(
-        (sum, item) =>
-          sum +
-          item.p *
-          item.weight / total,
+        (a, c) =>
+          a + c.p * c.weight / total,
         0
       );
 
     const quality =
       candidates.reduce(
-        (sum, item) =>
-          sum +
-          item.quality *
-          item.weight / total,
+        (a, c) =>
+          a + c.quality *
+          c.weight / total,
         0
       );
 
@@ -629,39 +663,28 @@ function predict(input) {
 
       quality,
 
-      windows: candidates.map(
-        item => ({
-          size: item.size,
+      windows: candidates.map(c => ({
+        size: c.size,
 
-          probabilityTai: item.p,
+        probabilityTai: c.p,
 
-          quality: item.quality,
+        quality: c.quality,
 
-          weight:
-            item.weight / total
-        })
-      )
+        weight: c.weight / total
+      }))
     };
   });
 
   // ========================================
-  // ADAPTIVE MODEL WEIGHTS
+  // ADAPTIVE MODEL WEIGHTING
   // ========================================
 
-  const rawWeights = evaluated.map(
-    item => Math.exp(
-      Math.max(
-        -5,
-        Math.min(
-          5,
-          item.quality * 12
-        )
-      )
-    )
+  const raw = evaluated.map(
+    c => Math.exp(12 * c.quality)
   );
 
-  const totalWeight = rawWeights.reduce(
-    (sum, w) => sum + w,
+  const total = raw.reduce(
+    (a, w) => a + w,
     0
   );
 
@@ -673,17 +696,13 @@ function predict(input) {
   // ========================================
 
   const modelPoints = evaluated.map(
-    (item, index) => {
-
-      const weight =
-        rawWeights[index] /
-        totalWeight;
-
-      const signal =
-        2 * item.probability - 1;
+    (c, i) => {
+      const weight = raw[i] / total;
 
       const signed =
-        100 * weight * signal;
+        100 *
+        weight *
+        (2 * c.probability - 1);
 
       const tai = Math.max(
         0,
@@ -699,20 +718,19 @@ function predict(input) {
       xiuPoints += xiu;
 
       return {
-        model: item.model,
+        model: c.model,
 
-        probabilityTai:
-          item.probability,
+        probabilityTai: c.probability,
 
         weight,
 
-        quality: item.quality,
+        quality: c.quality,
 
         tai,
 
         xiu,
 
-        windows: item.windows
+        windows: c.windows
       };
     }
   );
@@ -721,8 +739,7 @@ function predict(input) {
   // FINAL DECISION
   // ========================================
 
-  const net =
-    taiPoints - xiuPoints;
+  const net = taiPoints - xiuPoints;
 
   const side =
     Math.abs(net) > 1e-10
@@ -732,40 +749,55 @@ function predict(input) {
       : (s.at(-1) === 't' ? 'x' : 't');
 
   // ========================================
-  // MODEL QUALITY
+  // SIGNAL STRENGTH
   // ========================================
-
-  const quality = modelPoints.reduce(
-    (sum, item) =>
-      sum +
-      item.quality *
-      item.weight,
-    0
-  );
 
   const strength = Math.min(
     1,
     Math.abs(net) / 100
   );
 
+  // Muc do dong thuan cua cac mo hinh.
+
+  const agreement =
+    Math.abs(net) /
+
+    Math.max(
+      1e-10,
+      taiPoints + xiuPoints
+    );
+
   // ========================================
-  // NONLINEAR SIGNAL SCORE 51-99%
+  // NONLINEAR SIGNAL SCORE 51-99
   // ========================================
 
-  // Giu nguyen cong thuc V6.
+  // Diem tin hieu, khong phai
+  // xac suat thang thuc te.
+  //
+  // Dat 99 khi tin hieu du manh
+  // va cac mo hinh dong thuan.
+  //
   // Khong random.
-  // Diem tin hieu khong phai xac suat thang.
+  // Khong ep tang giam theo phien.
 
-  const smooth =
-    Math.log1p(4 * strength) /
-    Math.log(5);
+  const smooth = Math.min(
+    1,
+
+    Math.log1p(5 * strength) /
+    Math.log1p(5 * 0.75)
+  );
 
   const confidence = Math.max(
     51,
+
     Math.min(
       99,
+
       Math.round(
-        51 + 48 * smooth
+        51 +
+        48 *
+        smooth *
+        (0.65 + 0.35 * agreement)
       )
     )
   );
@@ -774,19 +806,19 @@ function predict(input) {
   // STATISTICAL RELIABILITY
   // ========================================
 
-  const positiveQuality = Math.max(
+  const quality = modelPoints.reduce(
+    (a, c) =>
+      a + c.quality * c.weight,
+    0
+  );
+
+  const positive = Math.max(
     0,
     quality
   );
 
   const reliability =
-    positiveQuality /
-    (positiveQuality + 0.05);
-
-  const probabilityTai = clip(
-    0.5 +
-    net * reliability / 200
-  );
+    positive / (positive + 0.05);
 
   return {
     side,
@@ -795,7 +827,9 @@ function predict(input) {
 
     scoreType: 'model_signal_score',
 
-    probabilityTai,
+    probabilityTai: clip(
+      0.5 + net * reliability / 200
+    ),
 
     taiPoints,
 
@@ -898,10 +932,7 @@ function apply(sessions) {
   const last =
     db.history.at(-1)?.id || 0;
 
-  const latestSource =
-    sessions.at(-1).id;
-
-  if (latestSource < last) {
+  if (sessions.at(-1).id < last) {
     throw new Error(
       'Source behind saved history'
     );
@@ -915,8 +946,7 @@ function apply(sessions) {
     r => r.id > last
   );
 
-  // Khong co phien moi
-  // thi khong tinh lai du doan.
+  // Khong tinh lai neu chua co phien moi.
 
   if (!migration && !incoming.length) {
     return false;
@@ -935,14 +965,11 @@ function apply(sessions) {
   };
 
   // ========================================
-  // MODEL MIGRATION
+  // MODEL VERSION MIGRATION
   // ========================================
 
   if (migration) {
     next.modelVersion = VERSION;
-
-    // Giu du lieu da tich luy
-    // tu cac phien ban V2 den V6.
 
     next.modelStart =
       [
@@ -950,17 +977,15 @@ function apply(sessions) {
         'six-points-v3',
         'six-points-v4',
         'six-points-v5',
-        'six-points-v6'
+        'six-points-v6',
+        'six-points-v7'
       ].includes(db.modelVersion) &&
+
       Number.isSafeInteger(db.modelStart)
 
         ? db.modelStart
 
         : sessions[0].id;
-
-    next.history = next.history.filter(
-      r => r.id < sessions[0].id
-    );
 
     const merged = new Map(
       next.history.map(
@@ -980,50 +1005,47 @@ function apply(sessions) {
   }
 
   // ========================================
-  // CHECK PREVIOUS PREDICTION
+  // CHECK PREVIOUS PREDICTIONS
   // ========================================
 
   for (const r of incoming) {
     const old =
       next.predictions[String(r.id)];
 
-    if (old) {
-      next.statistics.push({
-        id: r.id,
-
-        predicted: old.side,
-
-        actual: r.result,
-
-        confidence: old.confidence,
-
-        scoreType:
-          old.scoreType ||
-          'legacy_estimate',
-
-        correct:
-          old.side === r.result
-      });
-
-      console.log(
-        '[CHECK]',
-        r.id,
-
-        old.side === r.result
-          ? 'DUNG'
-          : 'SAI'
-      );
+    if (!old) {
+      continue;
     }
+
+    next.statistics.push({
+      id: r.id,
+
+      predicted: old.side,
+
+      actual: r.result,
+
+      confidence: old.confidence,
+
+      scoreType:
+        old.scoreType ||
+        'legacy_estimate',
+
+      correct:
+        old.side === r.result
+    });
+
+    console.log(
+      '[CHECK]',
+      r.id,
+
+      old.side === r.result
+        ? 'DUNG'
+        : 'SAI'
+    );
   }
 
   // ========================================
-  // FIFO STORAGE
+  // FIFO STORAGE MAX 200
   // ========================================
-
-  // 15 phien: bat dau phan tich.
-  // 16-200: tiep tuc tich luy.
-  // 201: xoa phien cu nhat.
-  // Luon giu toi da 200 phien.
 
   next.history =
     next.history.slice(-MAX);
@@ -1034,92 +1056,67 @@ function apply(sessions) {
   const key =
     String(latest + 1);
 
-  const pending =
-    next.predictions[key];
-
-  // ========================================
-  // GENERATE NEXT PREDICTION
-  // ========================================
-
   const analysis = recent(
     next.history,
     next.modelStart
   );
 
-  // Chi du doan khi co it nhat 15 phien.
+  // Du 15 phien moi bat dau du doan.
   // Giu nguyen du doan da cong bo.
 
   const prediction =
     analysis.length >= MIN_WINDOW
 
-      ? (pending || predict(analysis))
+      ? (
+          next.predictions[key] ||
+          predict(analysis)
+        )
 
       : null;
 
   next.predictions = prediction
+
     ? { [key]: prediction }
+
     : {};
 
   commit(next);
 
   // ========================================
-  // CONSOLE LOG
+  // CONSOLE LOGS
   // ========================================
 
   if (prediction) {
     console.log(
-      '================================'
-    );
-
-    console.log(
       '[PHIEN]',
-      latest
-    );
+      latest,
 
-    console.log(
       '[KET QUA]',
-      name(
-        next.history.at(-1).result
-      )
+      name(next.history.at(-1).result)
     );
 
     console.log(
       '[DU DOAN]',
-      name(prediction.side)
-    );
+      name(prediction.side),
 
-    console.log(
       '[DIEM TIN HIEU]',
       scorePct(prediction.confidence)
     );
 
     console.log(
       '[DIEM TAI]',
-      prediction.taiPoints?.toFixed(4)
-    );
+      prediction.taiPoints?.toFixed(4),
 
-    console.log(
       '[DIEM XIU]',
       prediction.xiuPoints?.toFixed(4)
     );
 
     console.log(
       '[PHAN TICH]',
-      analysis.length + '/200'
-    );
+      analysis.length + '/200',
 
-    console.log(
-      '[LICH SU]',
-      next.history.length + '/200'
-    );
-
-    console.log(
       '[WINDOWS]',
       prediction.analysisWindows
-    );
-
-    console.log(
-      '================================'
     );
 
   } else {
@@ -1133,7 +1130,7 @@ function apply(sessions) {
 }
 
 // ==========================================
-// AUTOMATIC API FETCH
+// AUTOMATIC API POLLING
 // ==========================================
 
 let lastSuccess = 0;
@@ -1171,7 +1168,6 @@ async function poll() {
     apply(sessions);
 
     lastSuccess = Date.now();
-
     lastError = false;
 
   } catch (e) {
@@ -1430,24 +1426,18 @@ async function loop() {
 if (require.main === module) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
-      '================================'
+      'LC79 MD5 API ONLINE',
+      VERSION,
+      'PORT:',
+      PORT
     );
 
-    console.log('LC79 MD5 API ONLINE');
-    console.log('VERSION:', VERSION);
-    console.log('PORT:', PORT);
-    console.log('API ID:', API_ID);
-    console.log('MODELS:', models.length);
-    console.log('MIN ANALYSIS:', MIN_WINDOW);
-    console.log('MAX ANALYSIS:', WINDOW);
-    console.log('WINDOWS:', WINDOWS);
-    console.log('MAX HISTORY:', MAX);
-    console.log('STORAGE: FIFO');
-    console.log('CHECK INTERVAL: 5s');
-    console.log('RANDOM: DISABLED');
-
     console.log(
-      '================================'
+      'MODELS:', models.length,
+      'MIN:', MIN_WINDOW,
+      'MAX:', WINDOW,
+      'FIFO:', MAX,
+      'RANDOM: DISABLED'
     );
 
     loop();
