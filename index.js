@@ -5,10 +5,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
 
-// ==========================================
-// CONFIGURATION
-// ==========================================
-
 const PORT = process.env.PORT || 3000;
 const API_ID = process.env.API_ID || 'noname09';
 
@@ -25,7 +21,11 @@ const MIN_WINDOW = 15;
 const WINDOW = 200;
 
 const INTERVAL = 5000;
-const VERSION = 'six-points-v9';
+const VERSION = 'six-points-v10';
+
+const CAUTION_WINDOW = 30;
+const CAUTION_LIMIT = 0.92;
+const RESET_COUNT = 10;
 
 const app = express();
 
@@ -39,7 +39,7 @@ app.use((req, res, next) => {
 });
 
 // ==========================================
-// UTILITIES
+// UTILITIES AND FIFO STORAGE
 // ==========================================
 
 const vnTime = () =>
@@ -68,22 +68,19 @@ const beta = (t, n, a = 3) =>
 const countT = s =>
   [...s].filter(c => c === 't').length;
 
-const sign = c =>
-  c === 't' ? 1 : -1;
-
-const decay = (age, half) =>
-  2 ** (-age / half);
-
-// ==========================================
-// DATABASE ENGINE
-// ==========================================
-
 const empty = () => ({
   history: [],
   sequence: '',
   predictions: {},
-  statistics: []
+  statistics: [],
+  cautionResults: [],
+  resetCount: 0,
+  lastReset: null
 });
+
+// ==========================================
+// DATABASE ENGINE
+// ==========================================
 
 function load() {
   if (!fs.existsSync(FILE)) {
@@ -106,6 +103,19 @@ function load() {
     throw new Error('Invalid history file');
   }
 
+  d.cautionResults =
+    Array.isArray(d.cautionResults)
+      ? d.cautionResults
+          .filter(v => v === 0 || v === 1)
+          .slice(-RESET_COUNT)
+      : [];
+
+  d.resetCount =
+    Number.isSafeInteger(d.resetCount) &&
+    d.resetCount >= 0
+      ? d.resetCount
+      : 0;
+
   d.history = d.history.slice(-MAX);
   d.sequence = sequence(d.history);
 
@@ -115,8 +125,7 @@ function load() {
 let db = load();
 
 // ==========================================
-// FIFO STORAGE
-// MIN 15 - MAX 200
+// FIFO STORAGE MAX 200
 // ==========================================
 
 function commit(next) {
@@ -165,12 +174,19 @@ function recent(h, start) {
 }
 
 // ==========================================
-// ALGORITHM 01
-// BAYESIAN FREQUENCY ANALYSIS
+// SIX COMPLEMENTARY MODELS
 // ==========================================
 
-// Phan tich tan suat tong the.
-// Su dung prior doi xung TAI/XIU.
+const sign = c =>
+  c === 't' ? 1 : -1;
+
+const decay = (age, half) =>
+  2 ** (-age / half);
+
+// ==========================================
+// ALGORITHM 01
+// BAYESIAN FREQUENCY
+// ==========================================
 
 function frequency(s) {
   return beta(
@@ -182,12 +198,8 @@ function frequency(s) {
 
 // ==========================================
 // ALGORITHM 02
-// BAYESIAN CHANGE POINT MIXTURE
+// CHANGE POINT MIXTURE
 // ==========================================
-
-// Phan tich su thay doi trang thai.
-// Khong mac dinh cau hien tai se lap lai.
-// So sanh nhieu do dai du lieu gan nhat.
 
 function regime(s) {
 
@@ -221,6 +233,7 @@ function regime(s) {
     .filter(k => k <= n - 8);
 
   for (const k of cuts) {
+
     const r = countT(
       s.slice(-k)
     );
@@ -231,12 +244,11 @@ function regime(s) {
       base;
 
     const w =
-      Math.exp(
-        Math.min(8, gain)
-      ) *
+      Math.exp(Math.min(8, gain)) *
       0.25 / cuts.length;
 
     sum += w * beta(r, k, 2);
+
     total += w;
   }
 
@@ -247,11 +259,6 @@ function regime(s) {
 // ALGORITHM 03
 // ADAPTIVE CONTEXT TREE
 // ==========================================
-
-// Nhan dien ngu canh tu 1 den 8 phien.
-// Khong mac dinh cau bet.
-// Khong mac dinh cau dao 1-1.
-// Hoc ket qua tiep theo cua tung ngu canh.
 
 function contextTree(s) {
   let p = 0.5;
@@ -267,6 +274,7 @@ function contextTree(s) {
     const suffix = s.slice(-k);
 
     for (let j = k; j < s.length; j++) {
+
       if (
         s.slice(j - k, j) !== suffix
       ) {
@@ -300,11 +308,6 @@ function contextTree(s) {
 // APPROXIMATE MOTIF RECOGNITION
 // ==========================================
 
-// Nhan dien mau cau tuong dong.
-// Chap nhan mau dao nguoc TAI/XIU.
-// Chap nhan sai khac toi da 1 vi tri.
-// Mau khop chinh xac co trong so cao hon.
-
 function motifs(s) {
   const k = 6;
   const n = s.length;
@@ -317,6 +320,7 @@ function motifs(s) {
   let total = 0;
 
   for (let j = k; j < n; j++) {
+
     let d = 0;
 
     for (let h = 1; h <= k; h++) {
@@ -352,12 +356,8 @@ function motifs(s) {
 // REGULARIZED LAG REGRESSION
 // ==========================================
 
-// Hoc moi lien he giua 8 phien gan nhat.
-// Trong so duoc cap nhat tuan tu.
-// Khong su dung random.
-// Khong mac dinh ket qua tiep theo.
-
 function lagRegression(s) {
+
   const k = 8;
 
   const w = Array(k + 1).fill(0);
@@ -372,7 +372,8 @@ function lagRegression(s) {
 
       ...Array.from(
         { length: k },
-        (_, j) => sign(s[i - j - 1])
+        (_, j) =>
+          sign(s[i - j - 1])
       )
     ];
 
@@ -388,6 +389,7 @@ function lagRegression(s) {
       Number(s[i] === 't') - p;
 
     for (let j = 0; j < w.length; j++) {
+
       w[j] +=
         0.08 *
         (
@@ -406,7 +408,6 @@ function lagRegression(s) {
 
     ...Array.from(
       { length: k },
-
       (_, j) =>
         sign(s[s.length - j - 1])
     )
@@ -426,24 +427,8 @@ function lagRegression(s) {
 // ADAPTIVE PERIODIC EXPERTS
 // ==========================================
 
-// Phan tich chu ky tu 2 den 12.
-//
-// Cau 1-1
-// Cau 2-1
-// Cau 1-2
-// Cau 2-2
-// Cau 3-1
-// Cau 1-3
-// Cau 3-2
-// Cau 2-3
-// Cau 3-3
-// Cau 4-4
-// Mau cau hon hop
-// Chu ky thuan va nghich.
-//
-// Khong mac dinh chu ky nao luon dung.
-
 function periodic(s) {
+
   let total = 1;
   let signal = 0;
 
@@ -484,10 +469,6 @@ function periodic(s) {
     const recentEdge =
       2 * beta(local, nl, 2) - 1;
 
-    // Chu ky phai co tin hieu
-    // lich su va tin hieu gan day
-    // cung huong.
-
     if (edge * recentEdge <= 0) {
       continue;
     }
@@ -508,7 +489,7 @@ function periodic(s) {
 }
 
 // ==========================================
-// EXACTLY SIX PREDICTION MODELS
+// EXACTLY SIX MODELS
 // ==========================================
 
 const models = [
@@ -521,10 +502,51 @@ const models = [
 ];
 
 // ==========================================
-// ADAPTIVE ENSEMBLE ENGINE V9
+// ENTROPY DETECTOR
+// ==========================================
+
+// Marginal binary entropy.
+// Khong phai phep kiem tra tinh ngau nhien.
+
+function entropy(s) {
+
+  if (s.length < CAUTION_WINDOW) {
+    return null;
+  }
+
+  const p =
+    countT(
+      s.slice(-CAUTION_WINDOW)
+    ) / CAUTION_WINDOW;
+
+  return p === 0 || p === 1
+
+    ? 0
+
+    : -p * Math.log2(p) -
+      (1 - p) * Math.log2(1 - p);
+}
+
+// ==========================================
+// CAUTION FLAG
+// ==========================================
+
+function cautionFlag(s) {
+
+  const h = entropy(s);
+
+  return (
+    h !== null &&
+    h > CAUTION_LIMIT
+  );
+}
+
+// ==========================================
+// ADAPTIVE ENSEMBLE ENGINE V10
 // ==========================================
 
 function predict(input) {
+
   const s = input.slice(-WINDOW);
 
   if (/[^tx]/.test(s)) {
@@ -542,9 +564,7 @@ function predict(input) {
   const fast = Array(m).fill(0);
   const slow = Array(m).fill(0);
 
-  // Ma tran tuong dong tin hieu.
-  // Giam viec nhieu mo hinh
-  // cung lap lai mot nhan dinh.
+  const rewards = Array(m).fill(0);
 
   const cross = Array.from(
     { length: m },
@@ -561,14 +581,10 @@ function predict(input) {
   // WALK FORWARD VALIDATION
   // ========================================
 
-  // Kiem nghiem tuan tu.
-  // Khong su dung du lieu tuong lai.
-  // So sanh voi moc 50/50.
-
   for (let i = 8; i < s.length; i++) {
 
-    const p = models.map(f =>
-      clip(
+    const p = models.map(
+      f => clip(
         f(s.slice(0, i))
       )
     );
@@ -590,6 +606,32 @@ function predict(input) {
       slow[j] =
         ds * slow[j] + gain;
 
+      // ====================================
+      // BANDIT ONLINE LEARNING
+      // ====================================
+
+      const direction =
+        Math.abs(p[j] - 0.5) < 1e-10
+
+          ? 0
+
+          : (p[j] > 0.5 ? 1 : -1);
+
+      rewards[j] =
+        0.95 * rewards[j] +
+
+        (
+          direction === 0
+
+            ? 0
+
+            : direction === (y ? 1 : -1)
+
+              ? 0.15
+
+              : -0.2
+        );
+
       for (let k = 0; k < m; k++) {
 
         cross[j][k] =
@@ -602,7 +644,7 @@ function predict(input) {
   }
 
   // ========================================
-  // MODEL QUALITY EVALUATION
+  // MODEL QUALITY
   // ========================================
 
   const quality = fast.map(
@@ -617,41 +659,51 @@ function predict(input) {
   // REDUNDANCY PENALTY
   // ========================================
 
-  // Hai mo hinh co tin hieu
-  // qua giong nhau se bi giam
-  // muc do anh huong tong hop.
-
   const raw = quality.map((q, j) => {
 
     let redundancy = 0;
 
     for (let k = 0; k < m; k++) {
 
-      if (k === j) {
-        continue;
+      if (k !== j) {
+
+        const corr =
+          cross[j][k] /
+
+          Math.sqrt(
+            Math.max(
+              1e-12,
+              cross[j][j] *
+              cross[k][k]
+            )
+          );
+
+        redundancy +=
+          Math.max(0, corr) ** 2;
       }
-
-      const corr =
-        cross[j][k] /
-
-        Math.sqrt(
-          Math.max(
-            1e-12,
-            cross[j][j] *
-            cross[k][k]
-          )
-        );
-
-      redundancy +=
-        Math.max(0, corr) ** 2;
     }
 
-    return Math.exp(
-      Math.max(
-        -8,
-        Math.min(8, 12 * q)
+    const bandit = Math.max(
+      0.3,
+
+      Math.min(
+        1.5,
+        1 + rewards[j]
       )
-    ) / (1 + 0.5 * redundancy);
+    );
+
+    return (
+      bandit *
+
+      Math.exp(
+        Math.max(
+          -8,
+          Math.min(8, 12 * q)
+        )
+      ) /
+
+      (1 + 0.5 * redundancy)
+    );
   });
 
   const total = raw.reduce(
@@ -663,7 +715,7 @@ function predict(input) {
   let xiuPoints = 0;
 
   // ========================================
-  // ADAPTIVE MODEL POINT SCORING
+  // MODEL POINT SCORING
   // ========================================
 
   const modelPoints = models.map(
@@ -679,11 +731,15 @@ function predict(input) {
         weight *
         (2 * p - 1);
 
-      const tai =
-        Math.max(0, signed);
+      const tai = Math.max(
+        0,
+        signed
+      );
 
-      const xiu =
-        Math.max(0, -signed);
+      const xiu = Math.max(
+        0,
+        -signed
+      );
 
       taiPoints += tai;
       xiuPoints += xiu;
@@ -711,8 +767,6 @@ function predict(input) {
   const net =
     taiPoints - xiuPoints;
 
-  // Khong uu tien mac dinh TAI/XIU.
-
   const side =
     Math.abs(net) > 1e-10
 
@@ -730,15 +784,13 @@ function predict(input) {
     0
   );
 
-  const positive =
-    Math.max(0, skill);
+  const positive = Math.max(
+    0,
+    skill
+  );
 
   const reliability =
     positive / (positive + 0.04);
-
-  // ========================================
-  // MODEL SIGNAL STRENGTH
-  // ========================================
 
   const strength = Math.min(
     1,
@@ -757,10 +809,10 @@ function predict(input) {
   // SIGNAL SCORE 51-99%
   // ========================================
 
-  // Diem tin hieu khong phai
-  // xac suat thang thuc te.
+  // Diem tin hieu, khong phai
+  // xac suat du doan dung.
   // Khong random.
-  // Khong ep tao do tin cay cao.
+  // Khong ep tao diem cao gia.
 
   const confidence = Math.max(
     51,
@@ -770,12 +822,20 @@ function predict(input) {
 
       Math.round(
         51 +
+
         48 *
+
         Math.min(
           1,
           strength / 0.65
         ) *
-        Math.sqrt(agreement)
+
+        Math.sqrt(agreement) *
+
+        Math.min(
+          1,
+          positive / 0.08
+        )
       )
     )
   );
@@ -800,6 +860,10 @@ function predict(input) {
 
     reliability,
 
+    caution: cautionFlag(s),
+
+    entropy: entropy(s),
+
     analyzedSessions: s.length,
 
     analysisWindows: [s.length]
@@ -811,6 +875,7 @@ function predict(input) {
 // ==========================================
 
 function parse(payload) {
+
   if (!Array.isArray(payload.list)) {
     throw new Error(
       'API schema: missing list'
@@ -822,7 +887,9 @@ function parse(payload) {
   for (const r of payload.list) {
 
     const id = Number(r.id);
-    const result = r.resultTruyenThong;
+
+    const result =
+      r.resultTruyenThong;
 
     if (
       !Number.isSafeInteger(id) ||
@@ -844,6 +911,7 @@ function parse(payload) {
 
     if (
       dices.length !== 3 ||
+
       !dices.every(d =>
         Number.isInteger(d) &&
         d >= 1 &&
@@ -902,13 +970,14 @@ function apply(sessions) {
 
   const migration =
     db.modelVersion !== VERSION ||
-    !Number.isSafeInteger(db.modelStart);
+
+    !Number.isSafeInteger(
+      db.modelStart
+    );
 
   const incoming = sessions.filter(
     r => r.id > last
   );
-
-  // Chi tinh lai khi co phien moi.
 
   if (!migration && !incoming.length) {
     return false;
@@ -923,7 +992,11 @@ function apply(sessions) {
       ...db.predictions
     },
 
-    statistics: [...db.statistics]
+    statistics: [...db.statistics],
+
+    cautionResults: [
+      ...db.cautionResults
+    ]
   };
 
   // ========================================
@@ -931,9 +1004,13 @@ function apply(sessions) {
   // ========================================
 
   if (migration) {
+
     next.modelVersion = VERSION;
 
+    next.cautionResults = [];
+
     next.modelStart =
+
       [
         'six-points-v2',
         'six-points-v3',
@@ -941,10 +1018,13 @@ function apply(sessions) {
         'six-points-v5',
         'six-points-v6',
         'six-points-v7',
-        'six-points-v8'
+        'six-points-v8',
+        'six-points-v9'
       ].includes(db.modelVersion) &&
 
-      Number.isSafeInteger(db.modelStart)
+      Number.isSafeInteger(
+        db.modelStart
+      )
 
         ? db.modelStart
 
@@ -964,6 +1044,7 @@ function apply(sessions) {
       .sort((a, b) => a.id - b.id);
 
   } else {
+
     next.history.push(...incoming);
   }
 
@@ -981,6 +1062,7 @@ function apply(sessions) {
     }
 
     next.statistics.push({
+
       id: r.id,
 
       predicted: old.side,
@@ -999,16 +1081,81 @@ function apply(sessions) {
 
     console.log(
       '[CHECK]',
+
       r.id,
 
       old.side === r.result
         ? 'DUNG'
         : 'SAI'
     );
+
+    // ======================================
+    // AUTO RESET ENGINE
+    // ======================================
+
+    // Chi dem du doan co co LUU Y.
+    // Du 10 lan luu y.
+    // Neu sai >= dung thi reset.
+
+    if (old.caution === true) {
+
+      next.cautionResults.push(
+        Number(
+          old.side === r.result
+        )
+      );
+
+      next.cautionResults =
+        next.cautionResults.slice(
+          -RESET_COUNT
+        );
+
+      if (
+
+        next.cautionResults.length ===
+          RESET_COUNT &&
+
+        next.cautionResults.reduce(
+          (a, b) => a + b,
+          0
+        ) * 2 <= RESET_COUNT
+
+      ) {
+
+        // Reset logic phan tich.
+        // Giu lich su va thong ke.
+        // Khong hoc lai du lieu truoc reset.
+
+        next.modelStart = r.id + 1;
+
+        next.cautionResults = [];
+
+        next.resetCount += 1;
+
+        next.lastReset = {
+          phien: r.id,
+
+          reason:
+            'caution_10_win_le_5',
+
+          at: vnTime()
+        };
+
+        next.predictions = {};
+
+        console.log(
+          '[RESET]',
+
+          r.id,
+
+          'WAIT 15 NEW SESSIONS'
+        );
+      }
+    }
   }
 
   // ========================================
-  // FIFO STORAGE MAX 200
+  // FIFO STORAGE
   // ========================================
 
   next.history =
@@ -1025,9 +1172,9 @@ function apply(sessions) {
     next.modelStart
   );
 
-  // Bat dau du doan tu 15 phien.
-  // Tu phien 201 xoa phien cu nhat.
-  // Giu nguyen du doan da cong bo.
+  // ========================================
+  // GENERATE NEXT PREDICTION
+  // ========================================
 
   const prediction =
     analysis.length >= MIN_WINDOW
@@ -1055,41 +1202,58 @@ function apply(sessions) {
 
     console.log(
       '[PHIEN]',
+
       latest,
 
       '[KET QUA]',
-      name(next.history.at(-1).result)
+
+      name(
+        next.history.at(-1).result
+      )
     );
 
     console.log(
       '[DU DOAN]',
+
       name(prediction.side),
 
       '[DIEM TIN HIEU]',
+
       scorePct(prediction.confidence)
     );
 
     console.log(
       '[DIEM TAI]',
+
       prediction.taiPoints?.toFixed(4),
 
       '[DIEM XIU]',
+
       prediction.xiuPoints?.toFixed(4)
     );
 
     console.log(
       '[PHAN TICH]',
+
       analysis.length + '/200',
 
       '[WINDOWS]',
-      prediction.analysisWindows
+
+      prediction.analysisWindows,
+
+      '[CAUTION]',
+
+      prediction.caution === true
     );
 
   } else {
 
     console.log(
       '[WAITING]',
-      analysis.length + '/' + MIN_WINDOW
+
+      analysis.length +
+      '/' +
+      MIN_WINDOW
     );
   }
 
@@ -1108,6 +1272,7 @@ async function poll() {
   try {
 
     const res = await fetch(API_URL, {
+
       method: 'GET',
 
       headers: {
@@ -1137,6 +1302,7 @@ async function poll() {
     apply(sessions);
 
     lastSuccess = Date.now();
+
     lastError = false;
 
   } catch (e) {
@@ -1170,6 +1336,7 @@ function output() {
   }
 
   return {
+
     id: API_ID,
 
     phienhientai: r.id,
@@ -1202,7 +1369,9 @@ function pretty(data) {
       ([k, v]) =>
 
         '  ' +
+
         JSON.stringify(k) +
+
         ': ' +
 
         (
@@ -1210,8 +1379,8 @@ function pretty(data) {
 
             ? '[' +
 
-              v.map(x =>
-                JSON.stringify(x)
+              v.map(
+                x => JSON.stringify(x)
               ).join(', ') +
 
               ']'
@@ -1233,6 +1402,20 @@ app.get(['/', '/api'], (req, res) => {
   const data = output();
 
   if (!data) {
+
+    const n = recent(
+      db.history,
+
+      db.modelStart ?? Infinity
+
+    ).length;
+
+    res.set(
+      'X-Analysis-Sessions',
+
+      String(n)
+    );
+
     return res.status(503).json({
       error: 'Dang cho du lieu API'
     });
@@ -1253,6 +1436,20 @@ app.get(['/', '/api'], (req, res) => {
       : 'Legacy probability estimate, not calibrated'
   );
 
+  res.set(
+    'X-Caution',
+
+    p.caution === true
+
+      ? 'true'
+
+      : p.caution === false
+
+        ? 'false'
+
+        : 'unknown'
+  );
+
   return res
     .type('application/json')
     .send(pretty(data));
@@ -1265,6 +1462,7 @@ app.get(['/', '/api'], (req, res) => {
 app.get('/lichsu', (req, res) => {
 
   return res.json({
+
     id: API_ID,
 
     sophien: db.history.length,
@@ -1272,6 +1470,7 @@ app.get('/lichsu', (req, res) => {
     max: MAX,
 
     sophienphantich:
+
       db.modelVersion === VERSION
 
         ? recent(
@@ -1301,6 +1500,7 @@ app.get('/thongke', (req, res) => {
   ).length;
 
   return res.json({
+
     id: API_ID,
 
     sophien: rows.length,
@@ -1330,12 +1530,15 @@ app.get('/thongke', (req, res) => {
       ketqua: name(r.actual),
 
       trangthai:
+
         r.correct ? 'DUNG' : 'SAI',
 
       dotincay:
+
         scorePct(r.confidence),
 
       loaidotincay:
+
         r.scoreType ||
         'legacy_estimate'
     }))
@@ -1343,7 +1546,7 @@ app.get('/thongke', (req, res) => {
 });
 
 // ==========================================
-// HEALTH CHECK
+// HEALTH CHECK AND RESET MONITOR
 // ==========================================
 
 app.get('/health', (req, res) => {
@@ -1351,7 +1554,9 @@ app.get('/health', (req, res) => {
   return res.json({
 
     status:
+
       lastError ||
+
       (
         lastSuccess &&
         Date.now() - lastSuccess > 15000
@@ -1376,7 +1581,21 @@ app.get('/health', (req, res) => {
 
     history: db.history.length,
 
-    uptime: process.uptime()
+    uptime: process.uptime(),
+
+    analysisSessions: recent(
+      db.history,
+      db.modelStart ?? Infinity
+    ).length,
+
+    cautionCount:
+      db.cautionResults.length,
+
+    resetCount:
+      db.resetCount,
+
+    lastReset:
+      db.lastReset
   });
 });
 
@@ -1410,16 +1629,23 @@ if (require.main === module) {
 
     console.log(
       'LC79 MD5 API ONLINE',
+
       VERSION,
+
       'PORT:',
+
       PORT
     );
 
     console.log(
       'MODELS:', models.length,
+
       'MIN:', MIN_WINDOW,
+
       'MAX:', WINDOW,
+
       'FIFO:', MAX,
+
       'RANDOM: DISABLED'
     );
 
@@ -1432,5 +1658,7 @@ module.exports = {
   parse,
   pretty,
   apply,
-  output
+  output,
+  entropy,
+  cautionFlag
 };
