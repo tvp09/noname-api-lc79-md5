@@ -16,12 +16,8 @@ const FILE = path.join(
   'lichsulc79md5.json'
 );
 
-const MAX = 200;
-const MIN_WINDOW = 15;
-const WINDOW = 200;
-
-const INTERVAL = 5000;
-const VERSION = 'six-points-v10';
+const MAX = 200, MIN_WINDOW = 15, WINDOW = 200;
+const INTERVAL = 5000, VERSION = 'six-points-v11';
 
 const CAUTION_WINDOW = 30;
 const CAUTION_LIMIT = 0.92;
@@ -248,7 +244,6 @@ function regime(s) {
       0.25 / cuts.length;
 
     sum += w * beta(r, k, 2);
-
     total += w;
   }
 
@@ -261,6 +256,7 @@ function regime(s) {
 // ==========================================
 
 function contextTree(s) {
+
   let p = 0.5;
 
   for (
@@ -268,6 +264,7 @@ function contextTree(s) {
     k <= Math.min(8, s.length - 1);
     k++
   ) {
+
     let t = 0;
     let n = 0;
 
@@ -309,6 +306,7 @@ function contextTree(s) {
 // ==========================================
 
 function motifs(s) {
+
   const k = 6;
   const n = s.length;
 
@@ -506,7 +504,7 @@ const models = [
 // ==========================================
 
 // Marginal binary entropy.
-// Khong phai phep kiem tra tinh ngau nhien.
+// Not a statistical randomness test.
 
 function entropy(s) {
 
@@ -542,7 +540,7 @@ function cautionFlag(s) {
 }
 
 // ==========================================
-// ADAPTIVE ENSEMBLE ENGINE V10
+// ADAPTIVE ENSEMBLE ENGINE V11
 // ==========================================
 
 function predict(input) {
@@ -656,7 +654,7 @@ function predict(input) {
   );
 
   // ========================================
-  // REDUNDANCY PENALTY
+  // ADAPTIVE WEIGHTING V11
   // ========================================
 
   const raw = quality.map((q, j) => {
@@ -702,7 +700,9 @@ function predict(input) {
         )
       ) /
 
-      (1 + 0.5 * redundancy)
+      (1 + 0.5 * redundancy) *
+
+      (0.15 + Math.max(0, q) * 10)
     );
   });
 
@@ -806,13 +806,12 @@ function predict(input) {
     );
 
   // ========================================
-  // SIGNAL SCORE 51-99%
+  // SIGNAL SCORE V11: 51-99%
   // ========================================
 
-  // Diem tin hieu, khong phai
-  // xac suat du doan dung.
-  // Khong random.
-  // Khong ep tao diem cao gia.
+  // Model signal score.
+  // NOT calibrated win probability.
+  // No random or forced high scores.
 
   const confidence = Math.max(
     51,
@@ -832,9 +831,11 @@ function predict(input) {
 
         Math.sqrt(agreement) *
 
-        Math.min(
-          1,
-          positive / 0.08
+        Math.sqrt(
+          Math.min(
+            1,
+            positive / 0.08
+          )
         )
       )
     )
@@ -1019,7 +1020,8 @@ function apply(sessions) {
         'six-points-v6',
         'six-points-v7',
         'six-points-v8',
-        'six-points-v9'
+        'six-points-v9',
+        'six-points-v10'
       ].includes(db.modelVersion) &&
 
       Number.isSafeInteger(
@@ -1090,12 +1092,13 @@ function apply(sessions) {
     );
 
     // ======================================
-    // AUTO RESET ENGINE
+    // AUTO RESET ENGINE V11
     // ======================================
 
     // Chi dem du doan co co LUU Y.
     // Du 10 lan luu y.
-    // Neu sai >= dung thi reset.
+    // Sai >= 7, dung <= 3 thi reset.
+    // Lay ngay 15 phien gan nhat.
 
     if (old.caution === true) {
 
@@ -1118,25 +1121,43 @@ function apply(sessions) {
         next.cautionResults.reduce(
           (a, b) => a + b,
           0
-        ) * 2 <= RESET_COUNT
+        ) <= 3
 
       ) {
 
-        // Reset logic phan tich.
-        // Giu lich su va thong ke.
-        // Khong hoc lai du lieu truoc reset.
+        // Reset moc phan tich.
+        // Khong xoa thong ke.
+        // Su dung ngay 15 phien gan nhat.
 
-        next.modelStart = r.id + 1;
+        next.modelStart =
+          sessions.at(-1).id -
+          MIN_WINDOW + 1;
+
+        const merged = new Map(
+          next.history.map(
+            v => [v.id, v]
+          )
+        );
+
+        for (const v of sessions) {
+          merged.set(v.id, v);
+        }
+
+        next.history =
+          [...merged.values()].sort(
+            (a, b) => a.id - b.id
+          );
 
         next.cautionResults = [];
 
         next.resetCount += 1;
 
         next.lastReset = {
+
           phien: r.id,
 
           reason:
-            'caution_10_win_le_5',
+            'caution_10_win_le_3',
 
           at: vnTime()
         };
@@ -1148,14 +1169,14 @@ function apply(sessions) {
 
           r.id,
 
-          'WAIT 15 NEW SESSIONS'
+          'RESEED LATEST 15 SESSIONS'
         );
       }
     }
   }
 
   // ========================================
-  // FIFO STORAGE
+  // FIFO STORAGE MAX 200
   // ========================================
 
   next.history =
@@ -1166,6 +1187,25 @@ function apply(sessions) {
 
   const key =
     String(latest + 1);
+
+  // ========================================
+  // RECOVER V10 WAITING STATE
+  // ========================================
+
+  if (
+    migration &&
+
+    db.modelVersion === 'six-points-v10' &&
+
+    recent(
+      next.history,
+      next.modelStart
+    ).length < MIN_WINDOW
+  ) {
+
+    next.modelStart =
+      latest - MIN_WINDOW + 1;
+  }
 
   const analysis = recent(
     next.history,
